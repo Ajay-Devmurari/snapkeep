@@ -58,8 +58,8 @@ bool _isMissed(SavedItem item) {
 
 /// "Missed", "Today", "Tomorrow", "In 3 days", or a plain date.
 String _when(DateTime d) {
+  if (d.isBefore(DateTime.now())) return 'Missed';
   final diff = _daysUntil(d);
-  if (diff < 0) return 'Missed';
   if (diff == 0) return 'Today';
   if (diff == 1) return 'Tomorrow';
   if (diff <= 7) return 'In $diff days';
@@ -67,9 +67,8 @@ String _when(DateTime d) {
 }
 
 Color _whenColor(DateTime d) {
-  final diff = _daysUntil(d);
-  if (diff < 0) return _overdueColor;
-  if (diff <= 1) return AppColors.accent;
+  if (d.isBefore(DateTime.now())) return _overdueColor;
+  if (_daysUntil(d) <= 1) return AppColors.accent;
   return _muted(0.6);
 }
 
@@ -94,12 +93,12 @@ String _heroTag(SavedItem item) => 'img_${item.id}';
 
 /// Image that fades in instead of popping.
 Widget _fadeImage(
-  File file, {
-  double? width,
-  double? height,
-  BoxFit fit = BoxFit.cover,
-  required Widget Function() onError,
-}) {
+    File file, {
+      double? width,
+      double? height,
+      BoxFit fit = BoxFit.cover,
+      required Widget Function() onError,
+    }) {
   return Image.file(
     file,
     width: width,
@@ -264,9 +263,9 @@ class _HomeScreenState extends State<HomeScreen> {
 
       final matchesSearch =
           query.isEmpty ||
-          item.title.toLowerCase().contains(query) ||
-          item.note.toLowerCase().contains(query) ||
-          item.category.toLowerCase().contains(query);
+              item.title.toLowerCase().contains(query) ||
+              item.note.toLowerCase().contains(query) ||
+              item.category.toLowerCase().contains(query);
 
       return matchesCategory && matchesSearch;
     }).toList();
@@ -275,15 +274,15 @@ class _HomeScreenState extends State<HomeScreen> {
   /// Every active reminder that is missed or within the next 7 days.
   List<SavedItem> get _upcomingAll {
     final list =
-        _items
-            .where(
-              (i) =>
-                  !i.isDone &&
-                  i.reminderDate != null &&
-                  _daysUntil(i.reminderDate!) <= 7,
-            )
-            .toList()
-          ..sort((a, b) => a.reminderDate!.compareTo(b.reminderDate!));
+    _items
+        .where(
+          (i) =>
+      !i.isDone &&
+          i.reminderDate != null &&
+          _daysUntil(i.reminderDate!) <= 7,
+    )
+        .toList()
+      ..sort((a, b) => a.reminderDate!.compareTo(b.reminderDate!));
 
     return list;
   }
@@ -363,9 +362,9 @@ class _HomeScreenState extends State<HomeScreen> {
 
   /// Runs a storage write. On failure, shows [message] with the error.
   Future<void> _runStorage(
-    Future<void> Function() operation,
-    String message,
-  ) async {
+      Future<void> Function() operation,
+      String message,
+      ) async {
     try {
       await operation();
     } catch (e) {
@@ -393,8 +392,8 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() => _loading = false);
       _showError(
         'Could not load saved items.\n'
-        'If you just added packages, STOP the app and run it again '
-        '(hot restart is not enough).\n$e',
+            'If you just added packages, STOP the app and run it again '
+            '(hot restart is not enough).\n$e',
       );
     }
   }
@@ -412,9 +411,9 @@ class _HomeScreenState extends State<HomeScreen> {
 
   /// Creates, replaces or removes the system notification of [item].
   Future<void> _syncReminder(
-    SavedItem item, {
-    bool askPermission = true,
-  }) async {
+      SavedItem item, {
+        bool askPermission = true,
+      }) async {
     try {
       if (item.reminderDate == null) {
         await NotificationService.instance.cancel(item);
@@ -430,14 +429,14 @@ class _HomeScreenState extends State<HomeScreen> {
           case ReminderPermission.skipped:
             _showError(
               'Reminder saved. Notifications are off, so it will not alert you '
-              'until you turn them on in Settings.',
+                  'until you turn them on in Settings.',
             );
           case ReminderPermission.denied:
             if (mounted) {
               await _showSettingsDialog(
                 title: 'Notifications are off',
                 message:
-                    'Allow notifications for SnapKeep in Settings, so your '
+                'Allow notifications for SnapKeep in Settings, so your '
                     'reminders can alert you on time.',
               );
             }
@@ -519,7 +518,7 @@ class _HomeScreenState extends State<HomeScreen> {
       await _showSettingsDialog(
         title: 'Camera access is off',
         message:
-            'To take a photo, allow camera access for SnapKeep in Settings.',
+        'To take a photo, allow camera access for SnapKeep in Settings.',
       );
     } else {
       _showError('Camera permission is needed to take a photo.');
@@ -579,10 +578,10 @@ class _HomeScreenState extends State<HomeScreen> {
       // kyunki camera ki photo bahut badi hoti hai.
       final image = source == ImageSource.camera
           ? await _picker.pickImage(
-              source: source,
-              imageQuality: 85,
-              maxWidth: 1920,
-            )
+        source: source,
+        imageQuality: 85,
+        maxWidth: 1920,
+      )
           : await _picker.pickImage(source: source);
 
       if (image == null || !mounted) return;
@@ -610,10 +609,11 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() => _items.insert(0, stored));
 
       await _runStorage(
-        () => _storage.insertItem(stored),
+            () => _storage.insertItem(stored),
         'Could not save your data.',
       );
 
+      if (!mounted) return;
       _syncReminder(stored);
     } catch (error) {
       if (!mounted) return;
@@ -663,7 +663,7 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() => _items[index] = cleaned);
 
     await _runStorage(
-      () => _storage.replaceItem(cleaned),
+          () => _storage.replaceItem(cleaned),
       'Could not save your changes.',
     );
 
@@ -695,7 +695,7 @@ class _HomeScreenState extends State<HomeScreen> {
     }
 
     await _runStorage(
-      () => _storage.setDone(item.id, nowDone),
+          () => _storage.setDone(item.id, nowDone),
       'Could not update the item.',
     );
   }
@@ -726,43 +726,43 @@ class _HomeScreenState extends State<HomeScreen> {
 
     messenger
         .showSnackBar(
-          SnackBar(
-            behavior: SnackBarBehavior.floating,
-            duration: const Duration(seconds: 5),
-            // Action wale snackbar ko Flutter default mein hatata nahi hai,
-            // isliye persist: false zaroori hai.
-            persist: false,
-            // Left ya right swipe karke hata sakte hain.
-            dismissDirection: DismissDirection.horizontal,
-            content: const Text('Screenshot deleted'),
-            action: SnackBarAction(
-              label: 'Undo',
-              onPressed: () {
-                undone = true;
-                if (!mounted) return;
+      SnackBar(
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 5),
+        // Action wale snackbar ko Flutter default mein hatata nahi hai,
+        // isliye persist: false zaroori hai.
+        persist: false,
+        // Left ya right swipe karke hata sakte hain.
+        dismissDirection: DismissDirection.horizontal,
+        content: const Text('Screenshot deleted'),
+        action: SnackBarAction(
+          label: 'Undo',
+          onPressed: () {
+            undone = true;
+            if (!mounted) return;
 
-                setState(() {
-                  _items.insert(index.clamp(0, _items.length), item);
-                });
+            setState(() {
+              _items.insert(index.clamp(0, _items.length), item);
+            });
 
-                _runStorage(
+            _runStorage(
                   () => _storage.insertItem(item, index: index),
-                  'Could not restore the item.',
-                );
-                _syncReminder(item, askPermission: false);
-              },
-            ),
-          ),
-        )
+              'Could not restore the item.',
+            );
+            _syncReminder(item, askPermission: false);
+          },
+        ),
+      ),
+    )
         .closed
         .then((_) {
-          if (!undone) _storage.deleteImage(item.image);
-        });
+      if (!undone) _storage.deleteImage(item.image);
+    });
 
     await NotificationService.instance.cancel(item);
 
     await _runStorage(
-      () => _storage.removeItem(item.id),
+          () => _storage.removeItem(item.id),
       'Could not delete the item.',
     );
   }
@@ -880,9 +880,9 @@ class _HomeScreenState extends State<HomeScreen> {
                     child: _buildEmptyState(),
                   )
                 else if (_viewMode == _ViewMode.grid)
-                  _buildGrid(items)
-                else
-                  _buildList(items),
+                    _buildGrid(items)
+                  else
+                    _buildList(items),
                 const SliverToBoxAdapter(child: SizedBox(height: 110)),
               ],
             ),
@@ -970,12 +970,12 @@ class _HomeScreenState extends State<HomeScreen> {
           prefixIcon: Icon(Icons.search_rounded, size: 20, color: _muted(0.5)),
           suffixIcon: _searchController.text.isNotEmpty
               ? IconButton(
-                  onPressed: () {
-                    _searchController.clear();
-                    setState(() {});
-                  },
-                  icon: Icon(Icons.close_rounded, size: 18, color: _muted(0.6)),
-                )
+            onPressed: () {
+              _searchController.clear();
+              setState(() {});
+            },
+            icon: Icon(Icons.close_rounded, size: 18, color: _muted(0.6)),
+          )
               : null,
           filled: true,
           fillColor: _muted(0.05),
@@ -1122,21 +1122,14 @@ class _HomeScreenState extends State<HomeScreen> {
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
         child: Row(
           children: [
-            // Status dot: red missed, green today/tomorrow, grey later.
-            Container(
-              width: 8,
-              height: 8,
-              decoration: BoxDecoration(color: color, shape: BoxShape.circle),
-            ),
-            const SizedBox(width: 12),
             ClipRRect(
               borderRadius: BorderRadius.circular(8),
               child: _fadeImage(
                 item.image,
-                width: 36,
-                height: 36,
+                width: 40,
+                height: 40,
                 onError: () =>
-                    SizedBox(width: 36, height: 36, child: _brokenImage()),
+                    SizedBox(width: 40, height: 40, child: _brokenImage()),
               ),
             ),
             const SizedBox(width: 12),
@@ -1154,7 +1147,7 @@ class _HomeScreenState extends State<HomeScreen> {
                       fontWeight: FontWeight.w500,
                     ),
                   ),
-                  const SizedBox(height: 2),
+                  const SizedBox(height: 3),
                   Text(
                     '${_when(date)} · ${_timeShort(date)}',
                     maxLines: 1,
@@ -1165,18 +1158,23 @@ class _HomeScreenState extends State<HomeScreen> {
                       fontWeight: FontWeight.w600,
                     ),
                   ),
-                  if (item.wasSnoozed) ...[
-                    const SizedBox(height: 4),
-                    _snoozedTag(),
-                  ],
-                  if (missed) ...[
-                    const SizedBox(height: 8),
-                    _missedActions(item),
-                  ],
                 ],
               ),
             ),
-            if (!missed)
+            if (missed) ...[
+              _iconAction(
+                icon: Icons.snooze_rounded,
+                tooltip: 'Snooze 10 min',
+                onTap: () => _quickSnooze(item, const Duration(minutes: 10)),
+              ),
+              const SizedBox(width: 8),
+              _iconAction(
+                icon: Icons.check_rounded,
+                tooltip: 'Done',
+                filled: true,
+                onTap: () => _toggleDone(item),
+              ),
+            ] else
               Icon(Icons.chevron_right_rounded, size: 20, color: _muted(0.35)),
           ],
         ),
@@ -1184,57 +1182,30 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  /// Quick actions shown under a missed reminder.
-  Widget _missedActions(SavedItem item) {
-    return Row(
-      children: [
-        _smallAction(
-          label: 'Snooze 10 min',
-          icon: Icons.snooze_rounded,
-          onTap: () => _quickSnooze(item, const Duration(minutes: 10)),
-        ),
-        const SizedBox(width: 8),
-        _smallAction(
-          label: 'Done',
-          icon: Icons.check_rounded,
-          filled: true,
-          onTap: () => _toggleDone(item),
-        ),
-      ],
-    );
-  }
-
-  Widget _smallAction({
-    required String label,
+  /// Small round button used on a missed reminder row.
+  Widget _iconAction({
     required IconData icon,
+    required String tooltip,
     required VoidCallback onTap,
     bool filled = false,
   }) {
-    final foreground = filled ? Colors.white : AppColors.accent;
-
-    return InkWell(
-      borderRadius: BorderRadius.circular(20),
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-        decoration: BoxDecoration(
-          color: filled ? AppColors.accent : AppColors.softAccent,
-          borderRadius: BorderRadius.circular(20),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, size: 13, color: foreground),
-            const SizedBox(width: 4),
-            Text(
-              label,
-              style: TextStyle(
-                color: foreground,
-                fontSize: 11.5,
-                fontWeight: FontWeight.w600,
-              ),
+    return Tooltip(
+      message: tooltip,
+      child: Material(
+        color: filled ? AppColors.accent : AppColors.softAccent,
+        shape: const CircleBorder(),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onTap,
+          child: SizedBox(
+            width: 36,
+            height: 36,
+            child: Icon(
+              icon,
+              size: 18,
+              color: filled ? Colors.white : AppColors.accent,
             ),
-          ],
+          ),
         ),
       ),
     );
@@ -1319,7 +1290,7 @@ class _HomeScreenState extends State<HomeScreen> {
           childAspectRatio: 0.62, // taller cells: screenshots are portrait
         ),
         delegate: SliverChildBuilderDelegate(
-          (context, index) => _gridItem(items[index]),
+              (context, index) => _gridItem(items[index]),
           childCount: items.length,
         ),
       ),
@@ -1354,7 +1325,11 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 ),
                 if (done) Positioned(top: 8, left: 8, child: _donePill()),
-                if (reminder != null && !done && item.wasSnoozed)
+                // "Snoozed" is hidden once the snoozed reminder is missed.
+                if (reminder != null &&
+                    !done &&
+                    item.wasSnoozed &&
+                    !_isMissed(item))
                   Positioned(top: 8, right: 8, child: _snoozedTag()),
                 if (reminder != null && !done)
                   Positioned(
@@ -1383,20 +1358,22 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ),
           const SizedBox(height: 2),
-          _metaText(item),
+          // The badge on the image already shows the reminder.
+          _metaText(item, showWhen: false),
         ],
       ),
     );
   }
 
   /// "Category" or "Category · Tomorrow" (reminder part is coloured).
-  Widget _metaText(SavedItem item) {
+  /// The grid hides the reminder part, because its badge already shows it.
+  Widget _metaText(SavedItem item, {bool showWhen = true}) {
     return Text.rich(
       TextSpan(
         style: TextStyle(color: _muted(0.6), fontSize: 12),
         children: [
           TextSpan(text: item.category),
-          if (item.reminderDate != null) ...[
+          if (showWhen && item.reminderDate != null) ...[
             const TextSpan(text: ' · '),
             TextSpan(
               text: _when(item.reminderDate!),
@@ -1744,7 +1721,7 @@ class _ScreenshotViewer extends StatelessWidget {
                           _chip(
                             icon: Icons.calendar_today_rounded,
                             label:
-                                '${_formatDate(reminder)} · ${_timeShort(reminder)}',
+                            '${_formatDate(reminder)} · ${_timeShort(reminder)}',
                           ),
                           _chip(
                             icon: missed

@@ -3,11 +3,11 @@ import 'dart:ui' show ImageFilter, TileMode;
 
 import 'package:flutter/cupertino.dart'
     show
-    CupertinoDatePicker,
-    CupertinoDatePickerMode,
-    CupertinoTextThemeData,
-    CupertinoTheme,
-    CupertinoThemeData;
+        CupertinoDatePicker,
+        CupertinoDatePickerMode,
+        CupertinoTextThemeData,
+        CupertinoTheme,
+        CupertinoThemeData;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
@@ -115,10 +115,10 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
 
   bool get _dirty =>
       _titleController.text.trim() != _initialTitle.trim() ||
-          _noteController.text.trim() != _initialNote.trim() ||
-          _category != _initialCategory ||
-          _image.path != widget.image.path ||
-          !_sameReminder(_reminderDate, _initialReminder);
+      _noteController.text.trim() != _initialNote.trim() ||
+      _category != _initialCategory ||
+      _image.path != widget.image.path ||
+      !_sameReminder(_reminderDate, _initialReminder);
 
   bool _sameReminder(DateTime? a, DateTime? b) {
     if (a == null && b == null) return true;
@@ -346,12 +346,18 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
   Future<void> _openReminderSheet() async {
     FocusScope.of(context).unfocus();
 
-    final now = DateTime.now();
+    // An existing reminder that is still in the future is kept.
+    // Otherwise (new, or already missed): today, current time + 1 minute.
+    final existing = _reminderDate;
+    final hasValidExisting =
+        existing != null && existing.isAfter(DateTime.now());
 
     // State lives OUTSIDE the builder so a rebuild can never reset it.
-    // Default for a new reminder: tomorrow, 9:00.
-    DateTime selected =
-        _reminderDate ?? DateTime(now.year, now.month, now.day + 1, 9, 0);
+    DateTime selected = hasValidExisting ? existing : _nextMinute();
+
+    // True once the time was chosen by hand (an existing reminder counts).
+    // Then it is kept when the user switches to another day.
+    bool timeEdited = hasValidExisting;
 
     // Bumped only when the time is changed by code (quick chips / date),
     // so the wheel jumps to the new time but is left alone while scrolling.
@@ -363,6 +369,7 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
       useSafeArea: true,
       backgroundColor: AppColors.surface,
       barrierColor: Colors.black54,
+      constraints: const BoxConstraints(maxWidth: 600),
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
       ),
@@ -372,22 +379,25 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
             final use24h = MediaQuery.alwaysUse24HourFormatOf(context);
             final isFuture = selected.isAfter(DateTime.now());
 
-            /// Same time of day on another day. If that moment already
-            /// passed today, fall back to the next minute.
+            /// Today: always current time + 1 minute.
+            /// Another day: 12:00 PM, unless the user picked a time by hand.
             DateTime withDay(DateTime day) {
-              final candidate = DateTime(
-                day.year,
-                day.month,
-                day.day,
-                selected.hour,
-                selected.minute,
-              );
+              if (DateUtils.isSameDay(day, DateTime.now())) {
+                timeEdited = false;
+                return _nextMinute();
+              }
 
-              if (candidate.isAfter(DateTime.now())) return candidate;
+              if (timeEdited) {
+                return DateTime(
+                  day.year,
+                  day.month,
+                  day.day,
+                  selected.hour,
+                  selected.minute,
+                );
+              }
 
-              return DateUtils.isSameDay(day, DateTime.now())
-                  ? _nextMinute()
-                  : candidate;
+              return DateTime(day.year, day.month, day.day, 12, 0);
             }
 
             Future<void> pickDate() async {
@@ -414,9 +424,8 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
             }
 
             Widget chip(String label, int days) {
-              final target = DateUtils.dateOnly(
-                DateTime.now(),
-              ).add(Duration(days: days));
+              final target = DateUtils.dateOnly(DateTime.now())
+                  .add(Duration(days: days));
 
               final active = DateUtils.isSameDay(selected, target);
 
@@ -585,6 +594,7 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
                                   initialDateTime: selected,
                                   onDateTimeChanged: (value) {
                                     setSheetState(() {
+                                      timeEdited = true;
                                       selected = DateTime(
                                         selected.year,
                                         selected.month,
@@ -617,15 +627,15 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
                         child: ElevatedButton(
                           onPressed: isFuture
                               ? () {
-                            // Re-check: time may have passed while open.
-                            if (!selected.isAfter(DateTime.now())) {
-                              setSheetState(() {});
-                              return;
-                            }
+                                  // Re-check: time may have passed while open.
+                                  if (!selected.isAfter(DateTime.now())) {
+                                    setSheetState(() {});
+                                    return;
+                                  }
 
-                            HapticFeedback.lightImpact();
-                            Navigator.pop(sheetContext, selected);
-                          }
+                                  HapticFeedback.lightImpact();
+                                  Navigator.pop(sheetContext, selected);
+                                }
                               : null,
                           style: ElevatedButton.styleFrom(
                             backgroundColor: AppColors.accent,
@@ -661,7 +671,6 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
     );
 
     if (!mounted || result == null) return;
-
     setState(() {
       _reminderDate = result;
       _reminderMissing = false;
@@ -750,9 +759,9 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
   // ───────────────────────── HELPERS ─────────────────────────
 
   String _reminderShort(DateTime d) {
-    final diff = DateUtils.dateOnly(
-      d,
-    ).difference(DateUtils.dateOnly(DateTime.now())).inDays;
+    final diff = DateUtils.dateOnly(d)
+        .difference(DateUtils.dateOnly(DateTime.now()))
+        .inDays;
 
     final String dateLabel;
 
@@ -762,7 +771,7 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
       dateLabel = 'Tomorrow';
     } else {
       dateLabel =
-      '${_weekdays[d.weekday - 1]}, ${d.day} ${_months[d.month - 1]}';
+          '${_weekdays[d.weekday - 1]}, ${d.day} ${_months[d.month - 1]}';
     }
 
     return '$dateLabel · ${_timeLabel(d)}';
@@ -865,7 +874,7 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
                   key: _formKey,
                   child: ListView(
                     keyboardDismissBehavior:
-                    ScrollViewKeyboardDismissBehavior.onDrag,
+                        ScrollViewKeyboardDismissBehavior.onDrag,
                     padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
                     children: [
                       _buildHeader(),
@@ -1178,8 +1187,8 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
                           color: hasDate
                               ? AppColors.text
                               : (_reminderMissing
-                              ? _red
-                              : AppColors.text.withValues(alpha: 0.38)),
+                                    ? _red
+                                    : AppColors.text.withValues(alpha: 0.38)),
                         ),
                       ),
                     ),

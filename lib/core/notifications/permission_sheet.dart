@@ -15,8 +15,8 @@ enum ReminderPermission { granted, denied, skipped }
 ///   user agrees. "Not now" returns [ReminderPermission.skipped].
 /// - Sheet already shown before: goes straight to the system dialog.
 Future<ReminderPermission> ensureReminderPermission(
-    BuildContext context,
-    ) async {
+  BuildContext context,
+) async {
   final service = NotificationService.instance;
 
   if (await service.notificationsEnabled()) {
@@ -43,13 +43,21 @@ Future<ReminderPermission> ensureReminderPermission(
 Future<bool?> _showPermissionSheet(BuildContext context) {
   return showModalBottomSheet<bool>(
     context: context,
+    // The sheet takes the height it needs instead of 9/16 of the screen.
+    isScrollControlled: true,
+    // Keeps the sheet below the status bar.
+    useSafeArea: true,
     backgroundColor: AppColors.surface,
+    // Not too wide on tablets and landscape.
+    constraints: const BoxConstraints(maxWidth: 600),
     showDragHandle: true,
     shape: const RoundedRectangleBorder(
       borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
     ),
     builder: (sheetContext) => SafeArea(
-      child: Padding(
+      // Scrolls on small screens or with a large system font,
+      // so the content can never overflow.
+      child: SingleChildScrollView(
         padding: const EdgeInsets.fromLTRB(24, 8, 24, 20),
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -62,7 +70,7 @@ Future<bool?> _showPermissionSheet(BuildContext context) {
                 color: AppColors.softAccent,
                 borderRadius: BorderRadius.circular(18),
                 border: Border.all(
-                  color: AppColors.accent.withOpacity(0.25),
+                  color: AppColors.accent.withValues(alpha: 0.25),
                   width: 1,
                 ),
               ),
@@ -166,11 +174,7 @@ Widget _point(IconData icon, String text) {
       Expanded(
         child: Text(
           text,
-          style: TextStyle(
-            color: AppColors.text,
-            fontSize: 13.5,
-            height: 1.4,
-          ),
+          style: TextStyle(color: AppColors.text, fontSize: 13.5, height: 1.4),
         ),
       ),
     ],
