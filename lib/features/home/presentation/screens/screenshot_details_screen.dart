@@ -15,9 +15,17 @@ import 'package:snapkeep/core/categories/category_store.dart';
 
 import '../../../../core/theme/app_colors.dart';
 import '../../../categories/presentation/category_store.dart';
+import '../../../../core/ocr/screenshot_text_reader.dart';
 import '../../../home/models/saved_item.dart';
 
 const _red = Color(0xFFD6574E);
+
+/// What the reminder sheet returns.
+typedef _ReminderChoice = ({
+  DateTime when,
+  RepeatRule repeat,
+  AdvanceAlert advance,
+});
 
 class ScreenshotDetailsScreen extends StatefulWidget {
   const ScreenshotDetailsScreen({
@@ -71,6 +79,16 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
   String _initialCategory = 'Other';
   DateTime? _initialReminder;
 
+  RepeatRule _repeat = RepeatRule.none;
+  AdvanceAlert _advance = AdvanceAlert.none;
+  RepeatRule _initialRepeat = RepeatRule.none;
+  AdvanceAlert _initialAdvance = AdvanceAlert.none;
+
+  // On-device text reading (OCR) of the screenshot.
+  bool _reading = false;
+  ScreenshotInsights? _insights;
+  bool _insightsDismissed = false;
+
   static const _months = [
     'Jan',
     'Feb',
@@ -118,7 +136,9 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
       _noteController.text.trim() != _initialNote.trim() ||
       _category != _initialCategory ||
       _image.path != widget.image.path ||
-      !_sameReminder(_reminderDate, _initialReminder);
+      !_sameReminder(_reminderDate, _initialReminder) ||
+      _repeat != _initialRepeat ||
+      _advance != _initialAdvance;
 
   bool _sameReminder(DateTime? a, DateTime? b) {
     if (a == null && b == null) return true;
@@ -161,15 +181,23 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
       _category = item.category;
       _reminderDate = item.reminderDate;
       _categoryTouched = true;
+      _repeat = item.repeat;
+      _advance = item.advance;
     }
 
     _initialTitle = _titleController.text;
     _initialNote = _noteController.text;
     _initialCategory = _category;
     _initialReminder = _reminderDate;
+    _initialRepeat = _repeat;
+    _initialAdvance = _advance;
 
     _titleController.addListener(_onTextChanged);
     _noteController.addListener(_onTextChanged);
+    // New screenshot: read its text and suggest a title, category and date.
+    if (!_isEditing) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _readImage());
+    }
   }
 
   void _onTextChanged() {
@@ -218,6 +246,20 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
 
     HapticFeedback.lightImpact();
 
+    // The series is counted from the time the user chose. An unchanged
+    // series keeps its original start.
+    final initial = widget.initialItem;
+    final sameSeries =
+        initial != null &&
+        initial.repeat == _repeat &&
+        _sameReminder(initial.reminderDate, _reminderDate);
+
+    final anchor = !_repeat.repeats
+        ? null
+        : (sameSeries
+              ? (initial?.repeatAnchor ?? _reminderDate)
+              : _reminderDate);
+
     Navigator.of(context).pop(
       SavedItem(
         id: widget.initialItem?.id,
@@ -227,6 +269,9 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
         category: _category,
         note: _noteController.text.trim(),
         reminderDate: _reminderDate,
+        repeat: _repeat,
+        repeatAnchor: anchor,
+        advance: _advance,
       ),
     );
   }
@@ -241,6 +286,7 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
 
       HapticFeedback.selectionClick();
       setState(() => _image = File(picked.path));
+      _readImage();
     } catch (e) {
       if (!mounted) return;
 
@@ -295,6 +341,109 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
       _category = picked;
       _categoryTouched = true;
     });
+  }
+
+  // ───────────────────────── TEXT READING (OCR) ─────────────────────────
+
+  Future<void> _readImage() async {
+    final target = _image;
+
+    setState(() {
+      _reading = true;
+      _insights = null;
+      _insightsDismissed = false;
+    });
+
+    ScreenshotInsights? found;
+
+    try {
+      found = await ScreenshotTextReader.read(
+        target,
+        categoryPatterns: _patterns,
+        categories: CategoryStore.categories.value,
+      );
+    } catch (e) {
+      debugPrint('SnapKeep: could not read text: $e');
+    }
+
+    // The user may have picked another image or left the screen meanwhile.
+    if (!mounted || _image.path != target.path) return;
+
+    setState(() {
+      _reading = false;
+      _insights = found;
+    });
+  }
+
+  bool _titleApplied(ScreenshotInsights i) =>
+      i.title != null && _titleController.text.trim() == i.title;
+
+  bool _categoryApplied(ScreenshotInsights i) =>
+      i.category != null && _category == i.category;
+
+  bool _dateApplied(ScreenshotInsights i) =>
+      i.date != null && _sameReminder(_reminderDate, i.date);
+
+  void _useTitle(ScreenshotInsights i) {
+    final title = i.title;
+    if (title == null) return;
+
+    HapticFeedback.selectionClick();
+    _titleController.value = TextEditingValue(
+      text: title,
+      selection: TextSelection.collapsed(offset: title.length),
+    );
+  }
+
+  void _useCategory(ScreenshotInsights i) {
+    final category = i.category;
+    if (category == null) return;
+
+    HapticFeedback.selectionClick();
+    setState(() {
+      _category = category;
+      _categoryTouched = true;
+      if (category != _pendingCategory) _pendingCategory = null;
+    });
+  }
+
+  void _useDate(ScreenshotInsights i) {
+    final date = i.date;
+    if (date == null) return;
+
+    HapticFeedback.selectionClick();
+    setState(() {
+      _reminderDate = date;
+      _reminderMissing = false;
+    });
+  }
+
+  void _useAll(ScreenshotInsights i) {
+    _useTitle(i);
+    _useCategory(i);
+    _useDate(i);
+  }
+
+  /// The screenshot text on one line, cut at 500 characters.
+  String _noteSnippet(ScreenshotInsights i) {
+    final flat = i.text.replaceAll(RegExp(r'\s+'), ' ').trim();
+    return flat.length <= 500 ? flat : '${flat.substring(0, 500)}…';
+  }
+
+  bool _noteHasText(ScreenshotInsights i) =>
+      _noteController.text.contains(_noteSnippet(i));
+
+  void _addTextToNote(ScreenshotInsights i) {
+    HapticFeedback.selectionClick();
+
+    final existing = _noteController.text.trim();
+    final snippet = _noteSnippet(i);
+    final next = existing.isEmpty ? snippet : '$existing\n\n$snippet';
+
+    _noteController.value = TextEditingValue(
+      text: next,
+      selection: TextSelection.collapsed(offset: next.length),
+    );
   }
 
   // ───────────────────────── DATE / TIME HELPERS ─────────────────────────
@@ -363,7 +512,11 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
     // so the wheel jumps to the new time but is left alone while scrolling.
     int wheelVersion = 0;
 
-    final result = await showModalBottomSheet<DateTime>(
+    // Repeat and early alert are chosen in the same sheet.
+    RepeatRule repeat = _repeat;
+    AdvanceAlert advance = _advance;
+
+    final result = await showModalBottomSheet<_ReminderChoice>(
       context: context,
       isScrollControlled: true,
       useSafeArea: true,
@@ -378,6 +531,12 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
           builder: (context, setSheetState) {
             final use24h = MediaQuery.alwaysUse24HourFormatOf(context);
             final isFuture = selected.isAfter(DateTime.now());
+
+            // The early alert would ring before now, so it would never ring.
+            final alertPassed =
+                advance.enabled &&
+                !repeat.repeats &&
+                !advance.before(selected).isAfter(DateTime.now());
 
             /// Today: always current time + 1 minute.
             /// Another day: 12:00 PM, unless the user picked a time by hand.
@@ -462,6 +621,79 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
                     ),
                   ),
                 ),
+              );
+            }
+
+            /// A titled row of equal chips (used for Repeat and Alert before).
+            Widget optionRow<T>({
+              required String title,
+              required List<T> values,
+              required T current,
+              required String Function(T) labelOf,
+              required void Function(T) onPick,
+            }) {
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: TextStyle(
+                      color: AppColors.secondaryText,
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 0.6,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      for (var i = 0; i < values.length; i++) ...[
+                        if (i > 0) const SizedBox(width: 8),
+                        Expanded(
+                          child: GestureDetector(
+                            onTap: () {
+                              HapticFeedback.selectionClick();
+                              setSheetState(() => onPick(values[i]));
+                            },
+                            child: AnimatedContainer(
+                              duration: const Duration(milliseconds: 160),
+                              height: 40,
+                              alignment: Alignment.center,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 4,
+                              ),
+                              decoration: BoxDecoration(
+                                color: values[i] == current
+                                    ? AppColors.accent.withValues(alpha: 0.10)
+                                    : _fill,
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(
+                                  color: values[i] == current
+                                      ? AppColors.accent
+                                      : Colors.transparent,
+                                ),
+                              ),
+                              child: FittedBox(
+                                fit: BoxFit.scaleDown,
+                                child: Text(
+                                  labelOf(values[i]),
+                                  maxLines: 1,
+                                  style: TextStyle(
+                                    color: values[i] == current
+                                        ? AppColors.accent
+                                        : AppColors.text,
+                                    fontSize: 12.5,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ],
               );
             }
 
@@ -611,6 +843,36 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
                         ),
                       ),
 
+                      const SizedBox(height: 16),
+
+                      optionRow<RepeatRule>(
+                        title: 'REPEAT',
+                        values: RepeatRule.values,
+                        current: repeat,
+                        labelOf: (r) => r.label,
+                        onPick: (r) => repeat = r,
+                      ),
+
+                      const SizedBox(height: 14),
+
+                      optionRow<AdvanceAlert>(
+                        title: 'ALERT BEFORE',
+                        values: AdvanceAlert.values,
+                        current: advance,
+                        labelOf: (a) => a.label,
+                        onPick: (a) => advance = a,
+                      ),
+
+                      if (alertPassed)
+                        const Padding(
+                          padding: EdgeInsets.only(top: 10),
+                          child: Text(
+                            'That alert time has already passed, so it will '
+                            'not ring.',
+                            style: TextStyle(color: _red, fontSize: 12.5),
+                          ),
+                        ),
+
                       if (!isFuture)
                         const Padding(
                           padding: EdgeInsets.only(top: 10),
@@ -634,7 +896,11 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
                                   }
 
                                   HapticFeedback.lightImpact();
-                                  Navigator.pop(sheetContext, selected);
+                                  Navigator.pop(sheetContext, (
+                                    when: selected,
+                                    repeat: repeat,
+                                    advance: advance,
+                                  ));
                                 }
                               : null,
                           style: ElevatedButton.styleFrom(
@@ -671,8 +937,11 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
     );
 
     if (!mounted || result == null) return;
+
     setState(() {
-      _reminderDate = result;
+      _reminderDate = result.when;
+      _repeat = result.repeat;
+      _advance = result.advance;
       _reminderMissing = false;
     });
   }
@@ -878,6 +1147,7 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
                     padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
                     children: [
                       _buildHeader(),
+                      _buildInsights(),
                       const SizedBox(height: 26),
                       _label('CATEGORY'),
                       _buildCategoryRow(),
@@ -900,6 +1170,278 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
   // ───────────────────────── SECTIONS ─────────────────────────
 
   /// Header card: blurred backdrop, thumbnail on the left, title on the right.
+  ///
+  ///
+  ///
+  /// Reading indicator, then the card with what was found in the screenshot.
+  Widget _buildInsights() {
+    final insights = _insights;
+    final showCard =
+        !_reading &&
+        !_insightsDismissed &&
+        insights != null &&
+        insights.hasSuggestions;
+
+    final String stateKey = _reading ? 'reading' : (showCard ? 'card' : 'none');
+
+    final Widget child;
+    if (_reading) {
+      child = _readingChip();
+    } else if (showCard) {
+      child = _insightsCard(insights);
+    } else {
+      child = const SizedBox.shrink();
+    }
+
+    return AnimatedSize(
+      duration: const Duration(milliseconds: 320),
+      curve: Curves.easeOutCubic,
+      alignment: Alignment.topCenter,
+      child: AnimatedSwitcher(
+        duration: const Duration(milliseconds: 260),
+        transitionBuilder: (child, animation) => FadeTransition(
+          opacity: animation,
+          child: SlideTransition(
+            position: Tween<Offset>(
+              begin: const Offset(0, 0.06),
+              end: Offset.zero,
+            ).animate(animation),
+            child: child,
+          ),
+        ),
+        child: KeyedSubtree(key: ValueKey(stateKey), child: child),
+      ),
+    );
+  }
+
+  Widget _readingChip() {
+    return Padding(
+      padding: const EdgeInsets.only(top: 16),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        decoration: BoxDecoration(
+          color: _fill,
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Row(
+          children: [
+            SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                color: AppColors.accent,
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                'Reading text from your screenshot…',
+                style: TextStyle(color: AppColors.secondaryText, fontSize: 13),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _insightsCard(ScreenshotInsights i) {
+    final title = i.title;
+    final category = i.category;
+    final date = i.date;
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 16),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.fromLTRB(14, 8, 8, 8),
+        decoration: BoxDecoration(
+          color: AppColors.accent.withValues(alpha: 0.08),
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: AppColors.accent.withValues(alpha: 0.25)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  Icons.auto_awesome_rounded,
+                  size: 18,
+                  color: AppColors.accent,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Found in your screenshot',
+                    style: TextStyle(
+                      color: AppColors.accent,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                TextButton(
+                  onPressed: () => _useAll(i),
+                  style: TextButton.styleFrom(
+                    foregroundColor: AppColors.accent,
+                    visualDensity: VisualDensity.compact,
+                    textStyle: const TextStyle(
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  child: const Text('Use all'),
+                ),
+                IconButton(
+                  tooltip: 'Dismiss',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: () => setState(() => _insightsDismissed = true),
+                  icon: Icon(
+                    Icons.close_rounded,
+                    size: 18,
+                    color: AppColors.secondaryText,
+                  ),
+                ),
+              ],
+            ),
+            if (title != null)
+              _insightRow(
+                icon: Icons.title_rounded,
+                label: 'TITLE',
+                value: title,
+                applied: _titleApplied(i),
+                onUse: () => _useTitle(i),
+              ),
+            if (category != null)
+              _insightRow(
+                icon: CategoryStore.iconFor(category),
+                label: 'CATEGORY',
+                value: category,
+                applied: _categoryApplied(i),
+                onUse: () => _useCategory(i),
+              ),
+            if (date != null)
+              _insightRow(
+                icon: Icons.notifications_active_outlined,
+                label: 'REMINDER',
+                value: _reminderShort(date),
+                applied: _dateApplied(i),
+                onUse: () => _useDate(i),
+              ),
+            if (i.text.length >= 12 && !_noteHasText(i))
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(
+                  onPressed: () => _addTextToNote(i),
+                  icon: const Icon(Icons.notes_rounded, size: 16),
+                  label: const Text('Add screenshot text to note'),
+                  style: TextButton.styleFrom(
+                    foregroundColor: AppColors.accent,
+                    visualDensity: VisualDensity.compact,
+                    textStyle: const TextStyle(
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _insightRow({
+    required IconData icon,
+    required String label,
+    required String value,
+    required bool applied,
+    required VoidCallback onUse,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 6, right: 6),
+      child: Row(
+        children: [
+          Container(
+            width: 34,
+            height: 34,
+            decoration: BoxDecoration(
+              color: AppColors.accent.withValues(alpha: 0.14),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Icon(icon, size: 17, color: AppColors.accent),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: TextStyle(
+                    color: AppColors.secondaryText,
+                    fontSize: 10.5,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.8,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  value,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: AppColors.text,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          AnimatedSwitcher(
+            duration: const Duration(milliseconds: 220),
+            transitionBuilder: (child, animation) =>
+                ScaleTransition(scale: animation, child: child),
+            child: applied
+                ? Icon(
+                    Icons.check_circle_rounded,
+                    key: const ValueKey('applied'),
+                    size: 24,
+                    color: AppColors.accent,
+                  )
+                : GestureDetector(
+                    key: const ValueKey('use'),
+                    onTap: onUse,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 7,
+                      ),
+                      decoration: BoxDecoration(
+                        color: AppColors.accent.withValues(alpha: 0.16),
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      child: Text(
+                        'Use',
+                        style: TextStyle(
+                          color: AppColors.accent,
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildHeader() {
     return ClipRRect(
       borderRadius: BorderRadius.circular(20),
@@ -1147,9 +1689,16 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
 
   /// Reminder is required. Tapping the row opens the sheet to set or change
   /// it. There is no remove option.
+  /// Reminder is required. Tapping the row opens the sheet to set or change
+  /// it. There is no remove option.
   Widget _buildReminderRow() {
     final date = _reminderDate;
     final hasDate = date != null;
+
+    final extras = <String>[
+      if (_repeat.repeats) 'Repeats ${_repeat.label.toLowerCase()}',
+      if (_advance.enabled) 'Alert ${_advance.label.toLowerCase()}',
+    ];
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -1160,10 +1709,10 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
           child: InkWell(
             borderRadius: BorderRadius.circular(14),
             onTap: _openReminderSheet,
-            child: SizedBox(
-              height: 56,
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(minHeight: 56),
               child: Padding(
-                padding: const EdgeInsets.fromLTRB(16, 0, 10, 0),
+                padding: const EdgeInsets.fromLTRB(16, 10, 10, 10),
                 child: Row(
                   children: [
                     Icon(
@@ -1177,19 +1726,37 @@ class _ScreenshotDetailsScreenState extends State<ScreenshotDetailsScreen> {
                     ),
                     const SizedBox(width: 12),
                     Expanded(
-                      child: Text(
-                        hasDate ? _reminderShort(date) : 'Set a reminder',
-                        style: TextStyle(
-                          fontSize: 15,
-                          fontWeight: hasDate
-                              ? FontWeight.w600
-                              : FontWeight.w400,
-                          color: hasDate
-                              ? AppColors.text
-                              : (_reminderMissing
-                                    ? _red
-                                    : AppColors.text.withValues(alpha: 0.38)),
-                        ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            hasDate ? _reminderShort(date) : 'Set a reminder',
+                            style: TextStyle(
+                              fontSize: 15,
+                              fontWeight: hasDate
+                                  ? FontWeight.w600
+                                  : FontWeight.w400,
+                              color: hasDate
+                                  ? AppColors.text
+                                  : (_reminderMissing
+                                        ? _red
+                                        : AppColors.text.withValues(
+                                            alpha: 0.38,
+                                          )),
+                            ),
+                          ),
+                          if (hasDate && extras.isNotEmpty) ...[
+                            const SizedBox(height: 3),
+                            Text(
+                              extras.join(' · '),
+                              style: TextStyle(
+                                color: AppColors.accent,
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ],
+                        ],
                       ),
                     ),
                     Icon(

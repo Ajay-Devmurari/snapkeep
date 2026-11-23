@@ -7,6 +7,7 @@ import 'package:snapkeep/features/data/saved_items_storage.dart';
 import 'package:snapkeep/features/home/models/saved_item.dart';
 import 'package:timezone/data/latest.dart' as tzdata;
 import 'package:timezone/timezone.dart' as tz;
+import 'package:permission_handler/permission_handler.dart';
 
 class SnoozeAction {
   SnoozeAction._();
@@ -47,6 +48,19 @@ class NotificationService {
   static const _channelId = 'snapkeep_reminders';
   static const _channelName = 'Reminders';
   static const _channelDescription = 'Reminders for your saved screenshots';
+
+  /// A repeating reminder is scheduled as its next time (the normal id) plus
+  /// a few more times ahead (ids made from "itemId#k"). The app refreshes them
+  /// every time it opens, so the series keeps going even if the app stays
+  /// closed for a while.
+  static const _maxExtra = 13;
+
+  int _extraCount(RepeatRule rule) => switch (rule) {
+    RepeatRule.daily => 13, // about two weeks ahead
+    RepeatRule.weekly => 7, // about two months ahead
+    RepeatRule.monthly => 5, // about half a year ahead
+    RepeatRule.none => 0,
+  };
 
   /// Look of every reminder notification.
   ///
@@ -115,10 +129,6 @@ class NotificationService {
     if (_ready) return;
 
     tzdata.initializeTimeZones();
-
-    // Tip: a dedicated white-on-transparent status bar icon looks cleaner
-    // than the launcher icon. See the note in the chat about
-    // '@drawable/ic_stat_snapkeep'.
 
     final darwin = DarwinInitializationSettings(
       requestAlertPermission: false,
@@ -242,18 +252,29 @@ class NotificationService {
     });
   }
 
-  /// Marks the item done from the notification. Works even when the app was
-  /// closed, because it only touches storage and the notification.
+  /// "Done" from the notification. Works even when the app was closed,
+  /// because it only touches storage and notifications.
+  ///
+  /// A repeating reminder is not finished: it moves to its next time.
   Future<void> _markDone(String payload) async {
     try {
       await init();
 
       final itemId = payload.split('|').first;
-      await _plugin.cancel(id: _idForId(itemId));
-      await SavedItemsStorage.instance.setDone(itemId, true);
+      final advanced = await SavedItemsStorage.instance.markDoneOrAdvance(
+        itemId,
+      );
+
+      if (advanced != null) {
+        // Repeating: schedule the next time (and the ones after it).
+        await schedule(advanced);
+      } else {
+        await _plugin.cancel(id: _idForId(itemId));
+        await _cancelAdvance(itemId);
+      }
 
       changes.value++;
-      debugPrint('SnapKeep: marked done from notification ($itemId)');
+      debugPrint('SnapKeep: done from notification ($itemId)');
     } catch (e) {
       debugPrint('SnapKeep: mark done failed: $e');
     }
@@ -261,6 +282,9 @@ class NotificationService {
 
   /// Moves the reminder to [until] for the item in [payload]. Updates the
   /// notification and the saved reminderDate, so the app shows the new time.
+  ///
+  /// For a repeating reminder only this one alert moves. The later times of
+  /// the series stay as they are.
   Future<void> snooze(String payload, DateTime until) async {
     try {
       await init();
@@ -312,6 +336,64 @@ class NotificationService {
     return hash & 0x7FFFFFFF;
   }
 
+  /// Id of the k-th extra alert of a repeating reminder.
+  int _occurrenceId(String itemId, int k) => _idForId('$itemId#$k');
+
+  /// Id of the "heads up" alert before the k-th time of a reminder
+  /// (k = 0 is the first time).
+  int _advanceId(String itemId, int k) => _idForId('$itemId@$k');
+
+  Future<void> _cancelAdvance(String itemId) async {
+    for (var k = 0; k <= _maxExtra; k++) {
+      await _plugin.cancel(id: _advanceId(itemId, k));
+    }
+  }
+
+  /// "8:35 PM" style time.
+  String _timeText(DateTime d) {
+    final h = d.hour % 12 == 0 ? 12 : d.hour % 12;
+    final m = d.minute.toString().padLeft(2, '0');
+    return '$h:$m ${d.hour < 12 ? 'AM' : 'PM'}';
+  }
+
+  String _headsUpBody(AdvanceAlert advance, DateTime when, String note) {
+    final lead = switch (advance) {
+      AdvanceAlert.hour => 'In 1 hour, at ${_timeText(when)}',
+      AdvanceAlert.day => 'Tomorrow at ${_timeText(when)}',
+      AdvanceAlert.none => '',
+    };
+
+    return note.isEmpty ? lead : '$lead\n$note';
+  }
+
+  /// A heads-up has no buttons, so it can never move the real reminder.
+  NotificationDetails _headsUpDetailsFor(String title, String body) {
+    return NotificationDetails(
+      android: AndroidNotificationDetails(
+        _channelId,
+        _channelName,
+        channelDescription: _channelDescription,
+        importance: Importance.max,
+        priority: Priority.high,
+        category: AndroidNotificationCategory.reminder,
+        color: AppColors.accent,
+        ticker: title,
+        styleInformation: BigTextStyleInformation(body, contentTitle: title),
+      ),
+      iOS: const DarwinNotificationDetails(
+        presentAlert: true,
+        presentBadge: true,
+        presentSound: true,
+      ),
+    );
+  }
+
+  Future<void> _cancelOccurrences(String itemId) async {
+    for (var k = 1; k <= _maxExtra; k++) {
+      await _plugin.cancel(id: _occurrenceId(itemId, k));
+    }
+  }
+
   /// The note if there is one, otherwise the category.
   String _bodyFor(SavedItem item) {
     final note = item.note.trim();
@@ -336,17 +418,37 @@ class NotificationService {
         : AndroidScheduleMode.inexactAllowWhileIdle;
   }
 
-  Future<void> schedule(SavedItem item) async {
+  /// Schedules the reminder of [item]. A repeating reminder also gets its
+  /// next few times. [clearOccurrences] removes the old extra times first
+  /// (needed when the rule changed, for example from Daily to Never).
+  /// Schedules the reminder of [item]. A repeating reminder also gets its
+  /// next few times, and an item with an early alert gets a heads-up before
+  /// each of them. [clearOccurrences] removes the old extra times first
+  /// (needed when the rule changed, for example from Daily to Never).
+  Future<void> schedule(SavedItem item, {bool clearOccurrences = true}) async {
     await init();
 
-    final when = item.reminderDate;
+    if (clearOccurrences) {
+      await _cancelOccurrences(item.id);
+      await _cancelAdvance(item.id);
+    }
 
-    if (when == null || !when.isAfter(DateTime.now())) {
-      await cancel(item);
+    final now = DateTime.now();
+    var when = item.reminderDate;
+
+    // A repeating reminder that already passed jumps to its next time.
+    if (item.repeat.repeats && when != null && !when.isAfter(now)) {
+      when = item.repeat.nextAfter(item.repeatAnchor ?? when, now);
+    }
+
+    if (when == null || !when.isAfter(now)) {
+      await _plugin.cancel(id: _idForId(item.id));
       return;
     }
 
     final body = _bodyFor(item);
+    final payload = _buildPayload(item, body);
+    final mode = await _scheduleMode();
 
     await _plugin.zonedSchedule(
       id: _idForId(item.id),
@@ -354,17 +456,71 @@ class NotificationService {
       body: body,
       scheduledDate: tz.TZDateTime.from(when, tz.UTC),
       notificationDetails: _detailsFor(item.title, body),
-      androidScheduleMode: await _scheduleMode(),
-      payload: _buildPayload(item, body),
+      androidScheduleMode: mode,
+      payload: payload,
     );
 
-    debugPrint('SnapKeep: reminder scheduled for $when (${item.title})');
+    // Every time of the series, the next one first.
+    final times = <DateTime>[when];
+
+    if (item.repeat.repeats) {
+      final extra = item.repeat.upcoming(
+        item.repeatAnchor ?? when,
+        when,
+        _extraCount(item.repeat),
+      );
+
+      for (var k = 0; k < extra.length; k++) {
+        await _plugin.zonedSchedule(
+          id: _occurrenceId(item.id, k + 1),
+          title: item.title,
+          body: body,
+          scheduledDate: tz.TZDateTime.from(extra[k], tz.UTC),
+          notificationDetails: _detailsFor(item.title, body),
+          androidScheduleMode: mode,
+          payload: payload,
+        );
+      }
+
+      times.addAll(extra);
+    }
+
+    // Early alert ("1 hour before", "1 day before") for each time.
+    if (item.advance.enabled) {
+      final note = item.note.trim();
+
+      for (var k = 0; k < times.length; k++) {
+        final alertAt = item.advance.before(times[k]);
+        if (!alertAt.isAfter(now)) continue;
+
+        final headsUpTitle = 'Coming up · ${item.title}';
+        final headsUpBody = _headsUpBody(item.advance, times[k], note);
+
+        await _plugin.zonedSchedule(
+          id: _advanceId(item.id, k),
+          title: headsUpTitle,
+          body: headsUpBody,
+          scheduledDate: tz.TZDateTime.from(alertAt, tz.UTC),
+          notificationDetails: _headsUpDetailsFor(headsUpTitle, headsUpBody),
+          androidScheduleMode: mode,
+          payload: payload,
+        );
+      }
+    }
+
+    debugPrint(
+      'SnapKeep: reminder scheduled for $when (${item.title}, '
+      'repeat: ${item.repeat.name}, early alert: ${item.advance.name})',
+    );
   }
 
   Future<void> cancel(SavedItem item) async {
     try {
       await init();
       await _plugin.cancel(id: _idForId(item.id));
+
+      if (item.repeat.repeats) await _cancelOccurrences(item.id);
+      await _cancelAdvance(item.id);
     } catch (e) {
       debugPrint('SnapKeep: could not cancel reminder: $e');
     }
@@ -373,7 +529,9 @@ class NotificationService {
   Future<void> rescheduleAll(List<SavedItem> items) async {
     for (final item in items) {
       try {
-        await schedule(item);
+        // Extra times are cleared only for repeating items, so a normal
+        // reminder costs no extra work.
+        await schedule(item, clearOccurrences: item.repeat.repeats);
       } catch (e) {
         debugPrint('SnapKeep: could not reschedule "${item.title}": $e');
       }
@@ -381,12 +539,31 @@ class NotificationService {
   }
 
   /// True when the user has allowed notifications. Does not show any dialog.
+  /// True when the user has allowed notifications. Does not show any dialog.
   Future<bool> notificationsEnabled() async {
     await init();
 
     final android = _android;
     if (android != null) {
-      return await android.areNotificationsEnabled() ?? false;
+      final appEnabled = await android.areNotificationsEnabled() ?? false;
+      final permissionOk = await Permission.notification.isGranted;
+
+      // The "Reminders" channel can be switched off on its own.
+      var channelOk = true;
+      try {
+        final channels = await android.getNotificationChannels();
+        final mine = (channels ?? []).where((c) => c.id == _channelId);
+        if (mine.isNotEmpty) {
+          channelOk = mine.first.importance != Importance.none;
+        }
+      } catch (_) {}
+
+      debugPrint(
+        'SnapKeep: notifications app=$appEnabled permission=$permissionOk '
+        'channel=$channelOk',
+      );
+
+      return appEnabled && permissionOk && channelOk;
     }
 
     final ios = _ios;

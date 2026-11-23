@@ -7,6 +7,9 @@ import '../../../../core/theme/app_colors.dart';
 import '../../../../core/theme/theme_controller.dart';
 import '../../../../core/widgets/motion.dart';
 
+import 'package:snapkeep/features/data/saved_items_storage.dart';
+import 'package:snapkeep/features/trash/presentation/screens/recently_deleted_screen.dart';
+
 class SettingsScreen extends StatelessWidget {
   const SettingsScreen({super.key});
 
@@ -54,12 +57,21 @@ class SettingsScreen extends StatelessWidget {
                           child: _ThemeCard(dark: false, selected: !dark),
                         ),
                         const SizedBox(width: 14),
-                        Expanded(
-                          child: _ThemeCard(dark: true, selected: dark),
-                        ),
+                        Expanded(child: _ThemeCard(dark: true, selected: dark)),
                       ],
                     ),
                   ),
+                  const SizedBox(height: 30),
+                  const FadeSlideIn(
+                    delay: Duration(milliseconds: 240),
+                    child: _SectionLabel('DATA'),
+                  ),
+                  const SizedBox(height: 12),
+                  const FadeSlideIn(
+                    delay: Duration(milliseconds: 290),
+                    child: _RecentlyDeletedTile(),
+                  ),
+
                   const SizedBox(height: 30),
                   const FadeSlideIn(
                     delay: Duration(milliseconds: 260),
@@ -104,6 +116,124 @@ class _SectionLabel extends StatelessWidget {
   }
 }
 
+// ───────────────────────── RECENTLY DELETED TILE ─────────────────────────
+
+class _RecentlyDeletedTile extends StatefulWidget {
+  const _RecentlyDeletedTile();
+
+  @override
+  State<_RecentlyDeletedTile> createState() => _RecentlyDeletedTileState();
+}
+
+class _RecentlyDeletedTileState extends State<_RecentlyDeletedTile> {
+  int _count = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadCount();
+  }
+
+  Future<void> _loadCount() async {
+    try {
+      final deleted = await SavedItemsStorage.instance.loadDeleted();
+      if (!mounted) return;
+
+      setState(() => _count = deleted.length);
+    } catch (e) {
+      debugPrint('SnapKeep: could not count deleted items: $e');
+    }
+  }
+
+  Future<void> _open() async {
+    HapticFeedback.selectionClick();
+
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(builder: (_) => const RecentlyDeletedScreen()),
+    );
+
+    // Items may have been restored or removed meanwhile.
+    if (mounted) _loadCount();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return PressScale(
+      pressedScale: 0.98,
+      onTap: _open,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        decoration: BoxDecoration(
+          color: AppColors.text.withValues(alpha: 0.045),
+          borderRadius: BorderRadius.circular(20),
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 40,
+              height: 40,
+              decoration: BoxDecoration(
+                color: AppColors.softAccent,
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Icon(
+                Icons.delete_outline_rounded,
+                size: 20,
+                color: AppColors.accent,
+              ),
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Recently deleted',
+                    style: TextStyle(
+                      color: AppColors.text,
+                      fontSize: 14.5,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    'Kept for ${SavedItemsStorage.trashKeepDays} days, then '
+                    'removed for good.',
+                    style: TextStyle(
+                      color: AppColors.secondaryText,
+                      fontSize: 12.5,
+                      height: 1.4,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (_count > 0) ...[
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3),
+                decoration: BoxDecoration(
+                  color: AppColors.accent.withValues(alpha: 0.16),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(
+                  '$_count',
+                  style: TextStyle(
+                    color: AppColors.accent,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            ],
+            const SizedBox(width: 4),
+            Icon(Icons.chevron_right_rounded, color: AppColors.secondaryText),
+          ],
+        ),
+      ),
+    );
+  }
+}
 // ───────────────────────── HERO CARD ─────────────────────────
 
 class _HeroCard extends StatefulWidget {
@@ -227,7 +357,7 @@ class _HeroCardState extends State<_HeroCard>
                         const SizedBox(height: 4),
                         Text(
                           'Screenshots you’ll need later, back right when '
-                              'you need them.',
+                          'you need them.',
                           style: TextStyle(
                             color: AppColors.secondaryText,
                             fontSize: 13,
@@ -276,12 +406,12 @@ class _ThemeCard extends StatelessWidget {
           ),
           boxShadow: selected
               ? [
-            BoxShadow(
-              color: AppColors.accent.withValues(alpha: 0.22),
-              blurRadius: 18,
-              offset: const Offset(0, 6),
-            ),
-          ]
+                  BoxShadow(
+                    color: AppColors.accent.withValues(alpha: 0.22),
+                    blurRadius: 18,
+                    offset: const Offset(0, 6),
+                  ),
+                ]
               : const [],
         ),
         child: Column(
@@ -316,13 +446,13 @@ class _ThemeCard extends StatelessWidget {
                   curve: Curves.easeOutCubic,
                   child: selected
                       ? Padding(
-                    padding: const EdgeInsets.only(left: 6),
-                    child: Icon(
-                      Icons.check_circle_rounded,
-                      size: 16,
-                      color: AppColors.accent,
-                    ),
-                  )
+                          padding: const EdgeInsets.only(left: 6),
+                          child: Icon(
+                            Icons.check_circle_rounded,
+                            size: 16,
+                            color: AppColors.accent,
+                          ),
+                        )
                       : const SizedBox.shrink(),
                 ),
               ],
@@ -347,7 +477,10 @@ class _ThemeCard extends StatelessWidget {
           gradient: LinearGradient(
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
-            colors: [AppColors.accent.withValues(alpha: dark ? 0.55 : 0.75), bar],
+            colors: [
+              AppColors.accent.withValues(alpha: dark ? 0.55 : 0.75),
+              bar,
+            ],
           ),
         ),
       );
@@ -422,7 +555,8 @@ class _AboutCard extends StatelessWidget {
           const _AboutRow(
             icon: Icons.phone_android_rounded,
             title: 'Stored on your phone',
-            subtitle: 'Your screenshots and reminders stay only on this device.',
+            subtitle:
+                'Your screenshots and reminders stay only on this device.',
           ),
           Divider(height: 1, thickness: 0.6, color: AppColors.border),
           const _AboutRow(

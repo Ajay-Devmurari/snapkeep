@@ -1,17 +1,15 @@
 import 'dart:io';
 import 'dart:ui' show ImageFilter, TileMode;
 
+import 'package:snapkeep/core/notifications/snooze_sheet.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
-
-// PERMISSION: camera permission ke liye
 import 'package:permission_handler/permission_handler.dart';
 import 'package:snapkeep/core/categories/category_store.dart';
 
 import '../../../../core/notifications/notification_service.dart';
 import '../../../../core/notifications/permission_sheet.dart';
-import '../../../../core/notifications/snooze_sheet.dart';
 import '../../../../core/theme/app_colors.dart';
 import '../../../categories/presentation/category_store.dart';
 import '../../../data/saved_items_storage.dart';
@@ -19,10 +17,17 @@ import '../../../settings/presentation/screens/settings_screen.dart';
 import '../../models/saved_item.dart';
 import 'screenshot_details_screen.dart';
 
-/// What the viewer asks the home screen to do when it closes.
+enum _ViewMode { grid, list }
+
 enum _ScreenshotAction { edit, delete, done, snooze }
 
-enum _ViewMode { grid, list }
+/// What the viewer hands back: the action, and the item that was on screen.
+class _ViewerResult {
+  const _ViewerResult(this.action, this.item);
+
+  final _ScreenshotAction action;
+  final SavedItem item;
+}
 
 // ───────────────────────── HELPERS ─────────────────────────
 
@@ -58,8 +63,8 @@ bool _isMissed(SavedItem item) {
 
 /// "Missed", "Today", "Tomorrow", "In 3 days", or a plain date.
 String _when(DateTime d) {
-  if (d.isBefore(DateTime.now())) return 'Missed';
   final diff = _daysUntil(d);
+  if (diff < 0) return 'Missed';
   if (diff == 0) return 'Today';
   if (diff == 1) return 'Tomorrow';
   if (diff <= 7) return 'In $diff days';
@@ -67,8 +72,9 @@ String _when(DateTime d) {
 }
 
 Color _whenColor(DateTime d) {
-  if (d.isBefore(DateTime.now())) return _overdueColor;
-  if (_daysUntil(d) <= 1) return AppColors.accent;
+  final diff = _daysUntil(d);
+  if (diff < 0) return _overdueColor;
+  if (diff <= 1) return AppColors.accent;
   return _muted(0.6);
 }
 
@@ -91,14 +97,48 @@ String _badgeText(DateTime d) {
 
 String _heroTag(SavedItem item) => 'img_${item.id}';
 
+/// Frosted glass: blurs whatever is behind it, then lays a translucent tint
+/// and a hairline border on top.
+Widget _glass({
+  required Widget child,
+  BorderRadius? radius,
+  double sigma = 16,
+  Color? tint,
+  Color? borderColor,
+}) {
+  final r = radius ?? BorderRadius.circular(20);
+
+  return ClipRRect(
+    borderRadius: r,
+    child: BackdropFilter(
+      filter: ImageFilter.blur(
+        sigmaX: sigma,
+        sigmaY: sigma,
+        tileMode: TileMode.clamp,
+      ),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: tint ?? AppColors.surface.withValues(alpha: 0.72),
+          borderRadius: r,
+          border: Border.all(
+            color: borderColor ?? Colors.white.withValues(alpha: 0.08),
+            width: 0.8,
+          ),
+        ),
+        child: child,
+      ),
+    ),
+  );
+}
+
 /// Image that fades in instead of popping.
 Widget _fadeImage(
-    File file, {
-      double? width,
-      double? height,
-      BoxFit fit = BoxFit.cover,
-      required Widget Function() onError,
-    }) {
+  File file, {
+  double? width,
+  double? height,
+  BoxFit fit = BoxFit.cover,
+  required Widget Function() onError,
+}) {
   return Image.file(
     file,
     width: width,
@@ -117,83 +157,118 @@ Widget _fadeImage(
   );
 }
 
-/// Reminder pill shown on the bottom-left of a grid card.
+/// Reminder pill (frosted glass) shown on the bottom-left of a grid card.
 /// Red when missed, accent when today or tomorrow, dark otherwise.
-Widget _reminderBadge(DateTime date) {
+/// [repeats] shows a repeat icon instead of the bell.
+Widget _reminderBadge(DateTime date, {bool repeats = false}) {
   final missed = date.isBefore(DateTime.now());
   final soon = _daysUntil(date) <= 1;
 
-  final Color background;
+  final Color tint;
   if (missed) {
-    background = _overdueColor;
+    tint = _overdueColor.withValues(alpha: 0.85);
   } else if (soon) {
-    background = AppColors.accent;
+    tint = AppColors.accent.withValues(alpha: 0.85);
   } else {
-    background = Colors.black.withValues(alpha: 0.55);
+    tint = Colors.black.withValues(alpha: 0.45);
   }
 
-  return Container(
-    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-    decoration: BoxDecoration(
-      color: background,
-      borderRadius: BorderRadius.circular(20),
-    ),
-    child: Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Icon(
-          missed
-              ? Icons.error_outline_rounded
-              : Icons.notifications_active_rounded,
-          size: 11,
-          color: Colors.white,
-        ),
-        const SizedBox(width: 4),
-        Flexible(
-          child: Text(
-            missed ? 'Missed' : _badgeText(date),
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 10.5,
-              fontWeight: FontWeight.w600,
+  return _glass(
+    radius: BorderRadius.circular(20),
+    sigma: 10,
+    tint: tint,
+    borderColor: Colors.white.withValues(alpha: 0.18),
+    child: Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            missed
+                ? Icons.error_outline_rounded
+                : (repeats
+                      ? Icons.repeat_rounded
+                      : Icons.notifications_active_rounded),
+            size: 12,
+            color: Colors.white,
+          ),
+          const SizedBox(width: 5),
+          Flexible(
+            child: Text(
+              missed ? 'Missed' : _badgeText(date),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 10.5,
+                fontWeight: FontWeight.w600,
+              ),
             ),
           ),
-        ),
-      ],
+        ],
+      ),
     ),
   );
 }
 
 /// Check pill shown on the top-left of a done card.
 Widget _donePill() {
-  return Container(
-    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-    decoration: BoxDecoration(
-      color: AppColors.accent,
-      borderRadius: BorderRadius.circular(20),
-    ),
-    child: const Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Icon(Icons.check_rounded, size: 12, color: Colors.white),
-        SizedBox(width: 3),
-        Text(
-          'Done',
-          style: TextStyle(
-            color: Colors.white,
-            fontSize: 11,
-            fontWeight: FontWeight.w600,
+  return _glass(
+    radius: BorderRadius.circular(20),
+    sigma: 10,
+    tint: AppColors.accent.withValues(alpha: 0.85),
+    borderColor: Colors.white.withValues(alpha: 0.18),
+    child: const Padding(
+      padding: EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.check_rounded, size: 12, color: Colors.white),
+          SizedBox(width: 3),
+          Text(
+            'Done',
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+            ),
           ),
-        ),
-      ],
+        ],
+      ),
     ),
   );
 }
 
 /// Small tag shown after a reminder was moved by a snooze.
-Widget _snoozedTag() {
+/// [onImage] makes it a glass pill that sits on top of a photo.
+Widget _snoozedTag({bool onImage = false}) {
+  if (onImage) {
+    return _glass(
+      radius: BorderRadius.circular(20),
+      sigma: 10,
+      tint: Colors.black.withValues(alpha: 0.45),
+      borderColor: Colors.white.withValues(alpha: 0.18),
+      child: const Padding(
+        padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.snooze_rounded, size: 11, color: Colors.white),
+            SizedBox(width: 3),
+            Text(
+              'Snoozed',
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 10,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   return Container(
     padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
     decoration: BoxDecoration(
@@ -211,6 +286,103 @@ Widget _snoozedTag() {
   );
 }
 
+/// Round tinted icon button used in the header.
+Widget _headerButton({
+  required IconData icon,
+  required String tooltip,
+  required VoidCallback onPressed,
+}) {
+  return Padding(
+    padding: const EdgeInsets.only(left: 6),
+    child: Tooltip(
+      message: tooltip,
+      child: Material(
+        color: _muted(0.07),
+        shape: const CircleBorder(),
+        child: InkWell(
+          customBorder: const CircleBorder(),
+          onTap: onPressed,
+          child: SizedBox(
+            width: 40,
+            height: 40,
+            child: Icon(icon, size: 20, color: _muted(0.8)),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+/// One row inside a bottom sheet.
+Widget _sheetTile({
+  required IconData icon,
+  required String title,
+  required VoidCallback onTap,
+  Color? color,
+}) {
+  final c = color ?? AppColors.text;
+
+  return ListTile(
+    contentPadding: const EdgeInsets.symmetric(horizontal: 20),
+    leading: Container(
+      width: 38,
+      height: 38,
+      decoration: BoxDecoration(
+        color: c.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Icon(icon, size: 20, color: c),
+    ),
+    title: Text(
+      title,
+      style: TextStyle(color: c, fontSize: 15, fontWeight: FontWeight.w500),
+    ),
+    onTap: onTap,
+  );
+}
+
+/// Big square option (Camera / Gallery) in the add sheet.
+Widget _addOption({
+  required IconData icon,
+  required String label,
+  required VoidCallback onTap,
+}) {
+  return Material(
+    color: _muted(0.06),
+    borderRadius: BorderRadius.circular(20),
+    child: InkWell(
+      borderRadius: BorderRadius.circular(20),
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 22),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 54,
+              height: 54,
+              decoration: BoxDecoration(
+                color: AppColors.accent.withValues(alpha: 0.15),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(icon, size: 26, color: AppColors.accent),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              label,
+              style: TextStyle(
+                color: AppColors.text,
+                fontSize: 14.5,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+}
+
 // ───────────────────────── SCREEN ─────────────────────────
 
 class HomeScreen extends StatefulWidget {
@@ -220,7 +392,7 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final ImagePicker _picker = ImagePicker();
   final List<SavedItem> _items = [];
   final TextEditingController _searchController = TextEditingController();
@@ -230,6 +402,9 @@ class _HomeScreenState extends State<HomeScreen> {
 
   final SavedItemsStorage _storage = SavedItemsStorage.instance;
   bool _loading = true;
+
+  // True when the user has notifications turned off for the app.
+  bool _notificationsOff = false;
 
   /// All, then every category (built-in + user), then Done.
   List<String> get _categories => [
@@ -263,9 +438,9 @@ class _HomeScreenState extends State<HomeScreen> {
 
       final matchesSearch =
           query.isEmpty ||
-              item.title.toLowerCase().contains(query) ||
-              item.note.toLowerCase().contains(query) ||
-              item.category.toLowerCase().contains(query);
+          item.title.toLowerCase().contains(query) ||
+          item.note.toLowerCase().contains(query) ||
+          item.category.toLowerCase().contains(query);
 
       return matchesCategory && matchesSearch;
     }).toList();
@@ -274,15 +449,15 @@ class _HomeScreenState extends State<HomeScreen> {
   /// Every active reminder that is missed or within the next 7 days.
   List<SavedItem> get _upcomingAll {
     final list =
-    _items
-        .where(
-          (i) =>
-      !i.isDone &&
-          i.reminderDate != null &&
-          _daysUntil(i.reminderDate!) <= 7,
-    )
-        .toList()
-      ..sort((a, b) => a.reminderDate!.compareTo(b.reminderDate!));
+        _items
+            .where(
+              (i) =>
+                  !i.isDone &&
+                  i.reminderDate != null &&
+                  _daysUntil(i.reminderDate!) <= 7,
+            )
+            .toList()
+          ..sort((a, b) => a.reminderDate!.compareTo(b.reminderDate!));
 
     return list;
   }
@@ -294,7 +469,12 @@ class _HomeScreenState extends State<HomeScreen> {
   void initState() {
     super.initState();
 
+    WidgetsBinding.instance.addObserver(this);
+
     _loadItemsAndReschedule();
+
+    // Check if notifications are allowed.
+    _checkNotifications();
 
     // A snooze changed the stored data. Reload the list only.
     NotificationService.changes.addListener(_onExternalChange);
@@ -310,10 +490,68 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     NotificationService.changes.removeListener(_onExternalChange);
     CategoryStore.categories.removeListener(_onCategoriesChanged);
     _searchController.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _refreshRepeating();
+      // The user may have changed the permission in Settings.
+      _checkNotifications();
+    }
+  }
+
+  // Reads the permission (no dialog) and updates the banner.
+  Future<void> _checkNotifications() async {
+    try {
+      final enabled = await NotificationService.instance.notificationsEnabled();
+      if (!mounted) return;
+
+      if (_notificationsOff == enabled) {
+        setState(() => _notificationsOff = !enabled);
+      }
+    } catch (e) {
+      debugPrint('SnapKeep: could not check notifications: $e');
+    }
+  }
+
+  // "Turn on" button of the banner.
+  Future<void> _enableNotifications() async {
+    HapticFeedback.selectionClick();
+
+    final granted = await NotificationService.instance.ensurePermissions();
+    if (!mounted) return;
+
+    if (!granted) {
+      // Android will not show the system popup again after repeated "Deny",
+      // so send the user to the app settings.
+      await showNotificationSettingsDialog(context, force: true);
+    } else {
+      // Make sure every reminder has its system notification now.
+      NotificationService.instance.rescheduleAll(List<SavedItem>.of(_items));
+    }
+
+    _checkNotifications();
+  }
+
+  /// Moves repeating reminders that already passed to their next time.
+  Future<void> _refreshRepeating() async {
+    try {
+      final changed = await _storage.rollRepeating();
+      if (!changed || !mounted) return;
+
+      await _reloadList();
+      if (!mounted) return;
+
+      NotificationService.instance.rescheduleAll(List<SavedItem>.of(_items));
+    } catch (e) {
+      debugPrint('SnapKeep: could not refresh repeating reminders: $e');
+    }
   }
 
   void _onExternalChange() {
@@ -339,13 +577,15 @@ class _HomeScreenState extends State<HomeScreen> {
       ..showSnackBar(
         SnackBar(
           behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+          ),
           duration: const Duration(seconds: 8),
           content: Text(message),
         ),
       );
   }
 
-  /// Short confirmation message (not an error).
   void _showMessage(String message) {
     if (!mounted) return;
 
@@ -354,6 +594,9 @@ class _HomeScreenState extends State<HomeScreen> {
       ..showSnackBar(
         SnackBar(
           behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+          ),
           duration: const Duration(seconds: 3),
           content: Text(message),
         ),
@@ -362,9 +605,9 @@ class _HomeScreenState extends State<HomeScreen> {
 
   /// Runs a storage write. On failure, shows [message] with the error.
   Future<void> _runStorage(
-      Future<void> Function() operation,
-      String message,
-      ) async {
+    Future<void> Function() operation,
+    String message,
+  ) async {
     try {
       await operation();
     } catch (e) {
@@ -392,8 +635,8 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() => _loading = false);
       _showError(
         'Could not load saved items.\n'
-            'If you just added packages, STOP the app and run it again '
-            '(hot restart is not enough).\n$e',
+        'If you just added packages, STOP the app and run it again '
+        '(hot restart is not enough).\n$e',
       );
     }
   }
@@ -401,6 +644,14 @@ class _HomeScreenState extends State<HomeScreen> {
   /// Only at app start: reload, then make sure every future reminder has its
   /// system notification.
   Future<void> _loadItemsAndReschedule() async {
+    try {
+      await _storage.rollRepeating();
+      // Items deleted more than 30 days ago are removed for good.
+      await _storage.purgeExpired();
+    } catch (e) {
+      debugPrint('SnapKeep: start-up cleanup failed: $e');
+    }
+
     await _reloadList();
     if (!mounted) return;
 
@@ -410,61 +661,64 @@ class _HomeScreenState extends State<HomeScreen> {
   // ───────────────────────── NOTIFICATIONS ─────────────────────────
 
   /// Creates, replaces or removes the system notification of [item].
+  /// It never asks for permission by itself. If notifications are off, the
+  /// banner at the top tells the user, and its "Turn on" button asks.
   Future<void> _syncReminder(
-      SavedItem item, {
-        bool askPermission = true,
-      }) async {
+    SavedItem item, {
+    bool askPermission = true,
+  }) async {
     try {
       if (item.reminderDate == null) {
         await NotificationService.instance.cancel(item);
         return;
       }
 
-      if (askPermission) {
-        final result = await ensureReminderPermission(context);
-
-        switch (result) {
-          case ReminderPermission.granted:
-            break;
-          case ReminderPermission.skipped:
-            _showError(
-              'Reminder saved. Notifications are off, so it will not alert you '
-                  'until you turn them on in Settings.',
-            );
-          case ReminderPermission.denied:
-            if (mounted) {
-              await _showSettingsDialog(
-                title: 'Notifications are off',
-                message:
-                'Allow notifications for SnapKeep in Settings, so your '
-                    'reminders can alert you on time.',
-              );
-            }
-        }
-      }
-
-      // Scheduled even when skipped. It starts working once the user
-      // turns notifications on later.
+      // Scheduled even when notifications are off. It starts working once
+      // the user turns them on.
       await NotificationService.instance.schedule(item);
     } catch (e) {
       _showError('Could not schedule the reminder.\n$e');
+    } finally {
+      // Shows or hides the banner.
+      _checkNotifications();
     }
   }
 
-  // ───────────────────────── PERMISSION DIALOGS ─────────────────────────
+  // ───────────────────────── CAMERA PERMISSION ─────────────────────────
 
-  /// "Open Settings" dialog, used for camera and notifications.
-  Future<void> _showSettingsDialog({
-    required String title,
-    required String message,
-  }) {
+  // Checks / requests camera permission before the camera opens.
+  // true  = camera can be used.
+  // false = permission not granted, do not open the camera.
+  Future<bool> _ensureCameraPermission() async {
+    var status = await Permission.camera.status;
+    if (status.isGranted) return true;
+
+    // First time (or after one deny on Android): system popup.
+    if (!status.isPermanentlyDenied && !status.isRestricted) {
+      status = await Permission.camera.request();
+      if (status.isGranted) return true;
+    }
+
+    if (!mounted) return false;
+
+    if (status.isPermanentlyDenied || status.isRestricted) {
+      // The popup can not be shown any more, only Settings can turn it on.
+      await _showCameraSettingsDialog();
+    } else {
+      _showError('Camera permission is needed to take a photo.');
+    }
+    return false;
+  }
+
+  // "Open Settings" dialog.
+  Future<void> _showCameraSettingsDialog() {
     return showDialog<void>(
       context: context,
       builder: (dialogContext) => AlertDialog(
         backgroundColor: AppColors.surface,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
         title: Text(
-          title,
+          'Camera access is off',
           style: TextStyle(
             color: AppColors.text,
             fontSize: 17,
@@ -472,8 +726,8 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ),
         content: Text(
-          message,
-          style: TextStyle(color: _muted(0.7), fontSize: 14, height: 1.4),
+          'To take a photo, allow camera access for SnapKeep in Settings.',
+          style: TextStyle(color: _muted(0.7), fontSize: 14),
         ),
         actions: [
           TextButton(
@@ -487,10 +741,7 @@ class _HomeScreenState extends State<HomeScreen> {
             },
             child: Text(
               'Open Settings',
-              style: TextStyle(
-                color: AppColors.accent,
-                fontWeight: FontWeight.w600,
-              ),
+              style: TextStyle(color: AppColors.accent),
             ),
           ),
         ],
@@ -498,68 +749,89 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // PERMISSION: Camera kholne se pehle permission check / request karta hai.
-  // true  = camera use kar sakte hain.
-  // false = permission nahi mili, camera nahi kholna.
-  Future<bool> _ensureCameraPermission() async {
-    var status = await Permission.camera.status;
-    if (status.isGranted) return true;
+  // ───────────────────────── SHEETS ─────────────────────────
 
-    // Pehli baar (ya Android par ek baar deny ke baad): system popup.
-    if (!status.isPermanentlyDenied && !status.isRestricted) {
-      status = await Permission.camera.request();
-      if (status.isGranted) return true;
-    }
-
-    if (!mounted) return false;
-
-    if (status.isPermanentlyDenied || status.isRestricted) {
-      // User popup nahi dekh sakta ab, Settings se hi ON ho sakta hai.
-      await _showSettingsDialog(
-        title: 'Camera access is off',
-        message:
-        'To take a photo, allow camera access for SnapKeep in Settings.',
-      );
-    } else {
-      _showError('Camera permission is needed to take a photo.');
-    }
-    return false;
+  /// Blurred glass bottom sheet with a drag handle.
+  Future<void> _showGlassSheet(WidgetBuilder builder) {
+    return showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      elevation: 0,
+      barrierColor: Colors.black.withValues(alpha: 0.4),
+      builder: (sheetContext) => _glass(
+        radius: const BorderRadius.vertical(top: Radius.circular(28)),
+        sigma: 28,
+        tint: AppColors.surface.withValues(alpha: 0.82),
+        child: SafeArea(
+          top: false,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SizedBox(height: 10),
+              Container(
+                width: 38,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: _muted(0.2),
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              const SizedBox(height: 10),
+              builder(sheetContext),
+              const SizedBox(height: 12),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   // ───────────────────────── ACTIONS ─────────────────────────
 
-  /// "+" dabane par Camera / Gallery ka choice dikhata hai.
+  /// Tapping "+" shows the Camera / Gallery choice.
   void _showAddSheet() {
     HapticFeedback.selectionClick();
 
-    showModalBottomSheet<void>(
-      context: context,
-      backgroundColor: AppColors.surface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      builder: (sheetContext) => SafeArea(
+    _showGlassSheet(
+      (sheetContext) => Padding(
+        padding: const EdgeInsets.fromLTRB(20, 8, 20, 8),
         child: Column(
-          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const SizedBox(height: 8),
-            ListTile(
-              leading: const Icon(Icons.photo_camera_outlined),
-              title: const Text('Camera'),
-              onTap: () {
-                Navigator.pop(sheetContext);
-                _addScreenshot(ImageSource.camera);
-              },
+            Text(
+              'Add to SnapKeep',
+              style: TextStyle(
+                color: AppColors.text,
+                fontSize: 17,
+                fontWeight: FontWeight.w700,
+              ),
             ),
-            ListTile(
-              leading: const Icon(Icons.photo_library_outlined),
-              title: const Text('Gallery'),
-              onTap: () {
-                Navigator.pop(sheetContext);
-                _addScreenshot(ImageSource.gallery);
-              },
+            const SizedBox(height: 14),
+            Row(
+              children: [
+                Expanded(
+                  child: _addOption(
+                    icon: Icons.photo_camera_outlined,
+                    label: 'Camera',
+                    onTap: () {
+                      Navigator.pop(sheetContext);
+                      _addScreenshot(ImageSource.camera);
+                    },
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _addOption(
+                    icon: Icons.photo_library_outlined,
+                    label: 'Gallery',
+                    onTap: () {
+                      Navigator.pop(sheetContext);
+                      _addScreenshot(ImageSource.gallery);
+                    },
+                  ),
+                ),
+              ],
             ),
-            const SizedBox(height: 8),
           ],
         ),
       ),
@@ -567,21 +839,20 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _addScreenshot(ImageSource source) async {
-    // PERMISSION: camera sirf tab khulega jab permission mil jaye.
+    // The camera opens only after the permission is granted.
     if (source == ImageSource.camera) {
       final allowed = await _ensureCameraPermission();
       if (!allowed || !mounted) return;
     }
 
     try {
-      // Gallery pehle jaisi hi hai. Sirf camera photo ko chhota karte hain,
-      // kyunki camera ki photo bahut badi hoti hai.
+      // Only the camera photo is shrunk, because it is very large.
       final image = source == ImageSource.camera
           ? await _picker.pickImage(
-        source: source,
-        imageQuality: 85,
-        maxWidth: 1920,
-      )
+              source: source,
+              imageQuality: 85,
+              maxWidth: 1920,
+            )
           : await _picker.pickImage(source: source);
 
       if (image == null || !mounted) return;
@@ -609,11 +880,10 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() => _items.insert(0, stored));
 
       await _runStorage(
-            () => _storage.insertItem(stored),
+        () => _storage.insertItem(stored),
         'Could not save your data.',
       );
 
-      if (!mounted) return;
       _syncReminder(stored);
     } catch (error) {
       if (!mounted) return;
@@ -622,6 +892,9 @@ class _HomeScreenState extends State<HomeScreen> {
         SnackBar(
           content: Text('Could not select image: $error'),
           behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+          ),
         ),
       );
     }
@@ -640,51 +913,65 @@ class _HomeScreenState extends State<HomeScreen> {
     final index = _items.indexWhere((e) => e.id == item.id);
     if (index == -1) return;
 
-    // If the image was replaced, copy the new one into the app folder.
-    var edited = updatedItem;
-    final imageChanged = updatedItem.image.path != item.image.path;
-
-    if (imageChanged) {
-      try {
-        edited = await _storage.persistImage(updatedItem);
-      } catch (e) {
-        _showError('Could not store the new image.\n$e');
-        return;
-      }
-      if (!mounted) return;
-    }
-
     // Same reminder as before: keep the snoozed state.
     // Reminder changed by hand: it is no longer a snooze.
     final cleaned = updatedItem.reminderDate == item.reminderDate
-        ? edited.copyWith(wasSnoozed: item.wasSnoozed)
-        : edited.copyWith(wasSnoozed: false);
+        ? updatedItem.copyWith(wasSnoozed: item.wasSnoozed)
+        : updatedItem.copyWith(wasSnoozed: false);
 
     setState(() => _items[index] = cleaned);
 
     await _runStorage(
-          () => _storage.replaceItem(cleaned),
+      () => _storage.replaceItem(cleaned),
       'Could not save your changes.',
     );
-
-    // The old image is not needed anymore. Never delete it if the stored
-    // copy happens to use the same path.
-    if (imageChanged && edited.image.path != item.image.path) {
-      _storage.deleteImage(item.image);
-    }
 
     _syncReminder(cleaned);
   }
 
-  /// Marks the item done. Cancels its notification and clears the reminder.
-  /// Undoing it only marks it not done; the reminder must be set again.
-  Future<void> _toggleDone(SavedItem item) async {
+  /// Done. A repeating reminder is not finished by this: it moves to its next
+  /// time. [finish] ends it for good (stops repeating and marks it done).
+  /// Undoing a finished item only marks it not done; the reminder must be set
+  /// again.
+  Future<void> _toggleDone(SavedItem item, {bool finish = false}) async {
     final index = _items.indexWhere((e) => e.id == item.id);
     if (index == -1) return;
 
+    // Repeating and active: just go to the next time.
+    final anchor = item.repeatAnchor ?? item.reminderDate;
+    final now = DateTime.now();
+    final reminder = item.reminderDate;
+    // If the reminder is still ahead, take the time after it. Otherwise the
+    // same time comes back and Done would do nothing.
+    final from = (reminder != null && reminder.isAfter(now)) ? reminder : now;
+
+    final next =
+        (!finish && !item.isDone && item.repeat.repeats && anchor != null)
+        ? item.repeat.nextAfter(anchor, from)
+        : null;
+
+    if (next != null) {
+      final advanced = item.copyWith(reminderDate: next, wasSnoozed: false);
+
+      HapticFeedback.lightImpact();
+      setState(() => _items[index] = advanced);
+
+      await _runStorage(
+        () => _storage.replaceItem(advanced),
+        'Could not update the item.',
+      );
+
+      _syncReminder(advanced, askPermission: false);
+      return;
+    }
+
     final nowDone = !item.isDone;
     final updated = nowDone
-        ? item.copyWith(isDone: true, clearReminder: true)
+        ? item.copyWith(
+            isDone: true,
+            clearReminder: true,
+            repeat: RepeatRule.none,
+          )
         : item.copyWith(isDone: false);
 
     HapticFeedback.lightImpact();
@@ -695,24 +982,13 @@ class _HomeScreenState extends State<HomeScreen> {
     }
 
     await _runStorage(
-          () => _storage.setDone(item.id, nowDone),
+      () => _storage.setDone(item.id, nowDone),
       'Could not update the item.',
     );
   }
 
-  /// Snooze from the viewer: pick a time, then move the reminder.
-  Future<void> _snoozeFromViewer(SavedItem item) async {
-    final picked = await showSnoozeSheet(context);
-    if (picked == null || !mounted) return;
-
-    HapticFeedback.lightImpact();
-    await NotificationService.instance.snoozeItem(item, picked);
-
-    _showMessage('Snoozed to ${_when(picked)} · ${_timeShort(picked)}');
-  }
-
-  /// Deletes immediately and offers Undo (no confirmation dialog).
-  /// The image file is removed only after the Undo bar has gone away.
+  /// Moves the item to "Recently deleted" (kept for 30 days) and offers Undo.
+  /// There is no confirmation dialog, because nothing is lost.
   Future<void> _deleteItem(SavedItem item) async {
     final index = _items.indexWhere((e) => e.id == item.id);
     if (index == -1) return;
@@ -720,126 +996,144 @@ class _HomeScreenState extends State<HomeScreen> {
     HapticFeedback.mediumImpact();
     setState(() => _items.removeAt(index));
 
-    var undone = false;
-
-    final messenger = ScaffoldMessenger.of(context)..clearSnackBars();
-
-    messenger
-        .showSnackBar(
-      SnackBar(
-        behavior: SnackBarBehavior.floating,
-        duration: const Duration(seconds: 5),
-        // Action wale snackbar ko Flutter default mein hatata nahi hai,
-        // isliye persist: false zaroori hai.
-        persist: false,
-        // Left ya right swipe karke hata sakte hain.
-        dismissDirection: DismissDirection.horizontal,
-        content: const Text('Screenshot deleted'),
-        action: SnackBarAction(
-          label: 'Undo',
-          onPressed: () {
-            undone = true;
-            if (!mounted) return;
-
-            setState(() {
-              _items.insert(index.clamp(0, _items.length), item);
-            });
-
-            _runStorage(
-                  () => _storage.insertItem(item, index: index),
-              'Could not restore the item.',
-            );
-            _syncReminder(item, askPermission: false);
-          },
-        ),
-      ),
-    )
-        .closed
-        .then((_) {
-      if (!undone) _storage.deleteImage(item.image);
-    });
-
     await NotificationService.instance.cancel(item);
 
     await _runStorage(
-          () => _storage.removeItem(item.id),
+      () => _storage.moveToTrash(item.id),
       'Could not delete the item.',
     );
+
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context)
+      ..clearSnackBars()
+      ..showSnackBar(
+        SnackBar(
+          behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+          ),
+          duration: const Duration(seconds: 5),
+          // A snackbar with an action does not hide by itself by default.
+          persist: false,
+          // Swipe left or right to dismiss.
+          dismissDirection: DismissDirection.horizontal,
+          content: const Text('Moved to Recently deleted'),
+          action: SnackBarAction(
+            label: 'Undo',
+            onPressed: () async {
+              await _runStorage(
+                () => _storage.restore(item.id),
+                'Could not restore the item.',
+              );
+              if (!mounted) return;
+
+              // The item comes back to its old place in the list.
+              await _reloadList();
+              _syncReminder(item, askPermission: false);
+            },
+          ),
+        ),
+      );
   }
 
+  /// Opens the viewer on [item]. The viewer can swipe through the same list
+  /// that the home screen shows (category and search applied).
   Future<void> _openScreenshot(SavedItem item) async {
-    final action = await Navigator.of(context).push<_ScreenshotAction>(
+    final visible = _filteredItems;
+    var start = visible.indexWhere((e) => e.id == item.id);
+
+    // Not in the visible list (for example opened from a filtered view):
+    // show just this one.
+    final list = start == -1 ? <SavedItem>[item] : visible;
+    if (start == -1) start = 0;
+
+    final result = await Navigator.of(context).push<_ViewerResult>(
       MaterialPageRoute(
         fullscreenDialog: true,
-        builder: (_) => _ScreenshotViewer(item: item),
+        builder: (_) => _ScreenshotViewer(items: list, initialIndex: start),
       ),
     );
 
-    if (!mounted || action == null) return;
+    if (!mounted || result == null) return;
 
-    switch (action) {
+    // The item that was on screen when the button was pressed.
+    final current = result.item;
+
+    switch (result.action) {
       case _ScreenshotAction.delete:
-        await _deleteItem(item);
+        await _deleteItem(current);
+
       case _ScreenshotAction.edit:
-        await _editItem(item);
+        await _editItem(current);
+
       case _ScreenshotAction.done:
-        await _toggleDone(item);
+        final repeating = current.repeat.repeats && !current.isDone;
+        final wasDone = current.isDone;
+        await _toggleDone(current);
         _showMessage(
-          item.isDone ? 'Moved back to your list' : 'Marked as done',
+          wasDone
+              ? 'Moved back to your list'
+              : repeating
+              ? 'Done for now. It will remind you again.'
+              : 'Marked as done',
         );
+
       case _ScreenshotAction.snooze:
-        await _snoozeFromViewer(item);
+        final picked = await showSnoozeSheet(context);
+        if (picked == null || !mounted) return;
+
+        await NotificationService.instance.snoozeItem(current, picked);
+        _showMessage('Snoozed until ${_timeShort(picked)}');
     }
   }
 
   void _showItemMenu(SavedItem item) {
     HapticFeedback.selectionClick();
 
-    showModalBottomSheet<void>(
-      context: context,
-      backgroundColor: AppColors.surface,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      builder: (sheetContext) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const SizedBox(height: 8),
-            ListTile(
-              leading: const Icon(Icons.edit_outlined),
-              title: const Text('Edit'),
+    _showGlassSheet(
+      (sheetContext) => Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _sheetTile(
+            icon: Icons.edit_outlined,
+            title: 'Edit',
+            onTap: () {
+              Navigator.pop(sheetContext);
+              _editItem(item);
+            },
+          ),
+          _sheetTile(
+            icon: item.isDone
+                ? Icons.undo_rounded
+                : Icons.check_circle_outline_rounded,
+            title: item.isDone
+                ? 'Mark as not done'
+                : (item.repeat.repeats ? 'Done for this time' : 'Mark as done'),
+            onTap: () {
+              Navigator.pop(sheetContext);
+              _toggleDone(item);
+            },
+          ),
+          if (item.repeat.repeats && !item.isDone)
+            _sheetTile(
+              icon: Icons.stop_circle_outlined,
+              title: 'Finish and stop repeating',
               onTap: () {
                 Navigator.pop(sheetContext);
-                _editItem(item);
+                _toggleDone(item, finish: true);
               },
             ),
-            ListTile(
-              leading: Icon(
-                item.isDone
-                    ? Icons.undo_rounded
-                    : Icons.check_circle_outline_rounded,
-              ),
-              title: Text(item.isDone ? 'Mark as not done' : 'Mark as done'),
-              onTap: () {
-                Navigator.pop(sheetContext);
-                _toggleDone(item);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.delete_outline, color: _overdueColor),
-              title: const Text(
-                'Delete',
-                style: TextStyle(color: _overdueColor),
-              ),
-              onTap: () {
-                Navigator.pop(sheetContext);
-                _deleteItem(item);
-              },
-            ),
-            const SizedBox(height: 8),
-          ],
-        ),
+          _sheetTile(
+            icon: Icons.delete_outline,
+            title: 'Delete',
+            color: _overdueColor,
+            onTap: () {
+              Navigator.pop(sheetContext);
+              _deleteItem(item);
+            },
+          ),
+        ],
       ),
     );
   }
@@ -859,6 +1153,8 @@ class _HomeScreenState extends State<HomeScreen> {
             child: CustomScrollView(
               slivers: [
                 SliverToBoxAdapter(child: _buildTopBar()),
+                // Shown only when notifications are off.
+                SliverToBoxAdapter(child: _buildNotificationBanner()),
                 SliverToBoxAdapter(child: _buildSearch()),
                 SliverToBoxAdapter(child: _buildCategories()),
                 SliverToBoxAdapter(child: _buildUpcoming()),
@@ -880,25 +1176,39 @@ class _HomeScreenState extends State<HomeScreen> {
                     child: _buildEmptyState(),
                   )
                 else if (_viewMode == _ViewMode.grid)
-                    _buildGrid(items)
-                  else
-                    _buildList(items),
-                const SliverToBoxAdapter(child: SizedBox(height: 110)),
+                  _buildGrid(items)
+                else
+                  _buildList(items),
+                const SliverToBoxAdapter(child: SizedBox(height: 120)),
               ],
             ),
           ),
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _showAddSheet,
-        backgroundColor: AppColors.accent,
-        foregroundColor: Colors.white,
-        elevation: 0,
-        focusElevation: 0,
-        hoverElevation: 0,
-        highlightElevation: 0,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        child: const Icon(Icons.add_rounded, size: 26),
+      floatingActionButton: Container(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(20),
+          boxShadow: [
+            BoxShadow(
+              color: AppColors.accent.withValues(alpha: 0.35),
+              blurRadius: 20,
+              offset: const Offset(0, 8),
+            ),
+          ],
+        ),
+        child: FloatingActionButton(
+          onPressed: _showAddSheet,
+          backgroundColor: AppColors.accent,
+          foregroundColor: Colors.white,
+          elevation: 0,
+          focusElevation: 0,
+          hoverElevation: 0,
+          highlightElevation: 0,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: const Icon(Icons.add_rounded, size: 28),
+        ),
       ),
     );
   }
@@ -907,51 +1217,128 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Widget _buildTopBar() {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(24, 16, 12, 8),
+      padding: const EdgeInsets.fromLTRB(24, 16, 16, 8),
       child: Row(
         children: [
+          Container(
+            width: 32,
+            height: 32,
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [
+                  AppColors.accent,
+                  AppColors.accent.withValues(alpha: 0.65),
+                ],
+              ),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: const Icon(
+              Icons.bookmark_rounded,
+              size: 18,
+              color: Colors.white,
+            ),
+          ),
+          const SizedBox(width: 10),
           Text(
             'SnapKeep',
             style: TextStyle(
               color: AppColors.text,
-              fontSize: 20,
-              fontWeight: FontWeight.w600,
-              letterSpacing: -0.3,
+              fontSize: 22,
+              fontWeight: FontWeight.w700,
+              letterSpacing: -0.5,
             ),
           ),
           const Spacer(),
-          IconButton(
+          _headerButton(
+            icon: Icons.label_outline_rounded,
             tooltip: 'Categories',
             onPressed: () => showCategorySheet(context),
-            icon: Icon(
-              Icons.label_outline_rounded,
-              size: 21,
-              color: _muted(0.7),
-            ),
           ),
-          IconButton(
+          _headerButton(
+            icon: _viewMode == _ViewMode.grid
+                ? Icons.view_agenda_outlined
+                : Icons.grid_view_rounded,
             tooltip: _viewMode == _ViewMode.grid ? 'List view' : 'Grid view',
             onPressed: () => setState(() {
               _viewMode = _viewMode == _ViewMode.grid
                   ? _ViewMode.list
                   : _ViewMode.grid;
             }),
-            icon: Icon(
-              _viewMode == _ViewMode.grid
-                  ? Icons.view_agenda_outlined
-                  : Icons.grid_view_rounded,
-              size: 21,
-              color: _muted(0.7),
-            ),
           ),
-          IconButton(
+          _headerButton(
+            icon: Icons.settings_outlined,
             tooltip: 'Settings',
             onPressed: () => Navigator.of(
               context,
             ).push(MaterialPageRoute(builder: (_) => const SettingsScreen())),
-            icon: Icon(Icons.settings_outlined, size: 21, color: _muted(0.7)),
           ),
         ],
+      ),
+    );
+  }
+
+  // Banner shown when notifications are off and a reminder is active.
+  Widget _buildNotificationBanner() {
+    final hasReminders = _items.any((i) => !i.isDone && i.reminderDate != null);
+
+    if (!_notificationsOff || !hasReminders) return const SizedBox.shrink();
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(24, 8, 24, 0),
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(14, 10, 8, 10),
+        decoration: BoxDecoration(
+          color: _overdueColor.withValues(alpha: 0.12),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: _overdueColor.withValues(alpha: 0.30)),
+        ),
+        child: Row(
+          children: [
+            const Icon(
+              Icons.notifications_off_outlined,
+              size: 20,
+              color: _overdueColor,
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Notifications are off',
+                    style: TextStyle(
+                      color: AppColors.text,
+                      fontSize: 13.5,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    'Your reminders will not alert you.',
+                    style: TextStyle(
+                      color: AppColors.secondaryText,
+                      fontSize: 12,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            TextButton(
+              onPressed: _enableNotifications,
+              style: TextButton.styleFrom(
+                foregroundColor: _overdueColor,
+                visualDensity: VisualDensity.compact,
+                textStyle: const TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              child: const Text('Turn on'),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -965,35 +1352,46 @@ class _HomeScreenState extends State<HomeScreen> {
         cursorColor: AppColors.accent,
         style: TextStyle(color: AppColors.text, fontSize: 14.5),
         decoration: InputDecoration(
-          hintText: 'Search',
+          hintText: 'Search your screenshots',
           hintStyle: TextStyle(color: _muted(0.45), fontSize: 14.5),
-          prefixIcon: Icon(Icons.search_rounded, size: 20, color: _muted(0.5)),
+          prefixIcon: Icon(Icons.search_rounded, size: 21, color: _muted(0.5)),
           suffixIcon: _searchController.text.isNotEmpty
               ? IconButton(
-            onPressed: () {
-              _searchController.clear();
-              setState(() {});
-            },
-            icon: Icon(Icons.close_rounded, size: 18, color: _muted(0.6)),
-          )
+                  onPressed: () {
+                    _searchController.clear();
+                    setState(() {});
+                  },
+                  icon: Icon(Icons.close_rounded, size: 18, color: _muted(0.6)),
+                )
               : null,
           filled: true,
-          fillColor: _muted(0.05),
+          fillColor: _muted(0.06),
           isDense: true,
-          contentPadding: const EdgeInsets.symmetric(vertical: 14),
+          contentPadding: const EdgeInsets.symmetric(vertical: 15),
           border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(12),
+            borderRadius: BorderRadius.circular(16),
             borderSide: BorderSide.none,
+          ),
+          enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(16),
+            borderSide: BorderSide.none,
+          ),
+          focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(16),
+            borderSide: BorderSide(
+              color: AppColors.accent.withValues(alpha: 0.5),
+              width: 1.2,
+            ),
           ),
         ),
       ),
     );
   }
 
-  /// Horizontal, scrollable category chips. The count is hidden when 0.
+  /// Horizontal, scrollable category pills. The count is hidden when 0.
   Widget _buildCategories() {
     return Padding(
-      padding: const EdgeInsets.only(top: 18),
+      padding: const EdgeInsets.only(top: 16),
       child: SingleChildScrollView(
         scrollDirection: Axis.horizontal,
         padding: const EdgeInsets.symmetric(horizontal: 24),
@@ -1002,49 +1400,63 @@ class _HomeScreenState extends State<HomeScreen> {
             final selected = _selectedCategory == category;
             final count = _countFor(category);
 
-            return GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTap: () => setState(() => _selectedCategory = category),
-              child: Padding(
-                padding: const EdgeInsets.only(right: 18, bottom: 4),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text.rich(
-                      TextSpan(
-                        children: [
-                          TextSpan(
-                            text: category,
+            return Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () {
+                  HapticFeedback.selectionClick();
+                  setState(() => _selectedCategory = category);
+                },
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 200),
+                  curve: Curves.easeOut,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 8,
+                  ),
+                  decoration: BoxDecoration(
+                    color: selected ? AppColors.accent : _muted(0.06),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        category,
+                        style: TextStyle(
+                          fontSize: 13.5,
+                          fontWeight: selected
+                              ? FontWeight.w700
+                              : FontWeight.w500,
+                          color: selected ? Colors.white : _muted(0.7),
+                        ),
+                      ),
+                      if (count > 0) ...[
+                        const SizedBox(width: 6),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 1,
+                          ),
+                          decoration: BoxDecoration(
+                            color: selected
+                                ? Colors.white.withValues(alpha: 0.25)
+                                : _muted(0.08),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Text(
+                            '$count',
                             style: TextStyle(
-                              fontSize: 14,
-                              fontWeight: selected
-                                  ? FontWeight.w600
-                                  : FontWeight.w400,
-                              color: selected ? AppColors.text : _muted(0.5),
+                              fontSize: 11,
+                              fontWeight: FontWeight.w700,
+                              color: selected ? Colors.white : _muted(0.6),
                             ),
                           ),
-                          if (count > 0)
-                            TextSpan(
-                              text: ' $count',
-                              style: TextStyle(
-                                fontSize: 11.5,
-                                fontWeight: FontWeight.w600,
-                                color: selected
-                                    ? AppColors.accent
-                                    : _muted(0.4),
-                              ),
-                            ),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(height: 6),
-                    AnimatedContainer(
-                      duration: const Duration(milliseconds: 180),
-                      height: 1.5,
-                      width: selected ? 16 : 0,
-                      color: AppColors.accent,
-                    ),
-                  ],
+                        ),
+                      ],
+                    ],
+                  ),
                 ),
               ),
             );
@@ -1071,16 +1483,23 @@ class _HomeScreenState extends State<HomeScreen> {
         children: [
           Row(
             children: [
+              Icon(
+                Icons.notifications_active_rounded,
+                size: 16,
+                color: AppColors.accent,
+              ),
+              const SizedBox(width: 8),
               Text(
                 'Coming up',
                 style: TextStyle(
                   color: AppColors.text,
-                  fontSize: 14,
-                  fontWeight: FontWeight.w600,
+                  fontSize: 15,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: -0.2,
                 ),
               ),
               const Spacer(),
-              // Count sirf tab, jab card mein sab items na aa paye hon.
+              // Shown only when the card can not hold every item.
               if (hiddenCount > 0)
                 Text(
                   '+$hiddenCount more',
@@ -1088,18 +1507,35 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
             ],
           ),
-          const SizedBox(height: 10),
+          const SizedBox(height: 12),
           Container(
             decoration: BoxDecoration(
-              color: AppColors.surface,
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(color: AppColors.border, width: 0.8),
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [
+                  AppColors.accent.withValues(alpha: 0.14),
+                  AppColors.accent.withValues(alpha: 0.03),
+                ],
+              ),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(
+                color: AppColors.accent.withValues(alpha: 0.22),
+                width: 0.8,
+              ),
             ),
             child: Column(
               children: [
                 for (int i = 0; i < upcoming.length; i++) ...[
                   if (i > 0)
-                    Divider(height: 1, thickness: 0.6, color: _muted(0.1)),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 14),
+                      child: Divider(
+                        height: 1,
+                        thickness: 0.6,
+                        color: _muted(0.1),
+                      ),
+                    ),
                   _upcomingRow(upcoming[i]),
                 ],
               ],
@@ -1116,20 +1552,33 @@ class _HomeScreenState extends State<HomeScreen> {
     final missed = _isMissed(item);
 
     return InkWell(
-      borderRadius: BorderRadius.circular(14),
+      borderRadius: BorderRadius.circular(20),
       onTap: () => _openScreenshot(item),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
         child: Row(
           children: [
+            // Status dot: red missed, green today/tomorrow, grey later.
+            Container(
+              width: 8,
+              height: 8,
+              decoration: BoxDecoration(
+                color: color,
+                shape: BoxShape.circle,
+                boxShadow: [
+                  BoxShadow(color: color.withValues(alpha: 0.5), blurRadius: 6),
+                ],
+              ),
+            ),
+            const SizedBox(width: 12),
             ClipRRect(
-              borderRadius: BorderRadius.circular(8),
+              borderRadius: BorderRadius.circular(11),
               child: _fadeImage(
                 item.image,
-                width: 40,
-                height: 40,
+                width: 42,
+                height: 42,
                 onError: () =>
-                    SizedBox(width: 40, height: 40, child: _brokenImage()),
+                    SizedBox(width: 42, height: 42, child: _brokenImage()),
               ),
             ),
             const SizedBox(width: 12),
@@ -1143,13 +1592,14 @@ class _HomeScreenState extends State<HomeScreen> {
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
                       color: AppColors.text,
-                      fontSize: 14,
-                      fontWeight: FontWeight.w500,
+                      fontSize: 14.5,
+                      fontWeight: FontWeight.w600,
                     ),
                   ),
-                  const SizedBox(height: 3),
+                  const SizedBox(height: 2),
                   Text(
-                    '${_when(date)} · ${_timeShort(date)}',
+                    '${_when(date)} · ${_timeShort(date)}'
+                    '${item.repeat.repeats ? ' · ${item.repeat.label}' : ''}',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
@@ -1158,23 +1608,18 @@ class _HomeScreenState extends State<HomeScreen> {
                       fontWeight: FontWeight.w600,
                     ),
                   ),
+                  if (item.wasSnoozed) ...[
+                    const SizedBox(height: 4),
+                    _snoozedTag(),
+                  ],
+                  if (missed) ...[
+                    const SizedBox(height: 8),
+                    _missedActions(item),
+                  ],
                 ],
               ),
             ),
-            if (missed) ...[
-              _iconAction(
-                icon: Icons.snooze_rounded,
-                tooltip: 'Snooze 10 min',
-                onTap: () => _quickSnooze(item, const Duration(minutes: 10)),
-              ),
-              const SizedBox(width: 8),
-              _iconAction(
-                icon: Icons.check_rounded,
-                tooltip: 'Done',
-                filled: true,
-                onTap: () => _toggleDone(item),
-              ),
-            ] else
+            if (!missed)
               Icon(Icons.chevron_right_rounded, size: 20, color: _muted(0.35)),
           ],
         ),
@@ -1182,30 +1627,57 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  /// Small round button used on a missed reminder row.
-  Widget _iconAction({
+  /// Quick actions shown under a missed reminder.
+  Widget _missedActions(SavedItem item) {
+    return Row(
+      children: [
+        _smallAction(
+          label: 'Snooze 10 min',
+          icon: Icons.snooze_rounded,
+          onTap: () => _quickSnooze(item, const Duration(minutes: 10)),
+        ),
+        const SizedBox(width: 8),
+        _smallAction(
+          label: 'Done',
+          icon: Icons.check_rounded,
+          filled: true,
+          onTap: () => _toggleDone(item),
+        ),
+      ],
+    );
+  }
+
+  Widget _smallAction({
+    required String label,
     required IconData icon,
-    required String tooltip,
     required VoidCallback onTap,
     bool filled = false,
   }) {
-    return Tooltip(
-      message: tooltip,
-      child: Material(
-        color: filled ? AppColors.accent : AppColors.softAccent,
-        shape: const CircleBorder(),
-        clipBehavior: Clip.antiAlias,
-        child: InkWell(
-          onTap: onTap,
-          child: SizedBox(
-            width: 36,
-            height: 36,
-            child: Icon(
-              icon,
-              size: 18,
-              color: filled ? Colors.white : AppColors.accent,
+    final foreground = filled ? Colors.white : AppColors.accent;
+
+    return InkWell(
+      borderRadius: BorderRadius.circular(20),
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(
+          color: filled ? AppColors.accent : AppColors.softAccent,
+          borderRadius: BorderRadius.circular(20),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 13, color: foreground),
+            const SizedBox(width: 4),
+            Text(
+              label,
+              style: TextStyle(
+                color: foreground,
+                fontSize: 11.5,
+                fontWeight: FontWeight.w600,
+              ),
             ),
-          ),
+          ],
         ),
       ),
     );
@@ -1221,10 +1693,15 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Widget _buildCount(int count) {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(24, 22, 24, 14),
+      padding: const EdgeInsets.fromLTRB(24, 24, 24, 14),
       child: Text(
         count == 1 ? '1 item' : '$count items',
-        style: TextStyle(color: _muted(0.55), fontSize: 12.5),
+        style: TextStyle(
+          color: _muted(0.5),
+          fontSize: 12.5,
+          fontWeight: FontWeight.w500,
+          letterSpacing: 0.2,
+        ),
       ),
     );
   }
@@ -1240,12 +1717,34 @@ class _HomeScreenState extends State<HomeScreen> {
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
+          Container(
+            width: 84,
+            height: 84,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              gradient: RadialGradient(
+                colors: [
+                  AppColors.accent.withValues(alpha: 0.22),
+                  AppColors.accent.withValues(alpha: 0.04),
+                ],
+              ),
+            ),
+            child: Icon(
+              isSearching
+                  ? Icons.search_off_rounded
+                  : Icons.photo_library_outlined,
+              size: 36,
+              color: AppColors.accent,
+            ),
+          ),
+          const SizedBox(height: 20),
           Text(
             isSearching ? 'No results' : 'Nothing saved yet',
             style: TextStyle(
               color: AppColors.text,
-              fontSize: 16,
-              fontWeight: FontWeight.w600,
+              fontSize: 18,
+              fontWeight: FontWeight.w700,
+              letterSpacing: -0.3,
             ),
           ),
           const SizedBox(height: 6),
@@ -1290,7 +1789,7 @@ class _HomeScreenState extends State<HomeScreen> {
           childAspectRatio: 0.62, // taller cells: screenshots are portrait
         ),
         delegate: SliverChildBuilderDelegate(
-              (context, index) => _gridItem(items[index]),
+          (context, index) => _gridItem(items[index]),
           childCount: items.length,
         ),
       ),
@@ -1300,6 +1799,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget _gridItem(SavedItem item) {
     final done = item.isDone;
     final reminder = item.reminderDate;
+    final showBadge = reminder != null && !done;
 
     return GestureDetector(
       onTap: () => _openScreenshot(item),
@@ -1309,71 +1809,106 @@ class _HomeScreenState extends State<HomeScreen> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Expanded(
-            child: Stack(
-              children: [
-                Positioned.fill(
-                  child: Hero(
-                    tag: _heroTag(item),
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(12),
-                      // Done items are faded so active reminders stand out.
+            child: Container(
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(20),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.2),
+                    blurRadius: 18,
+                    offset: const Offset(0, 8),
+                  ),
+                ],
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(20),
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    // Done items are faded so active reminders stand out.
+                    Hero(
+                      tag: _heroTag(item),
                       child: Opacity(
-                        opacity: done ? 0.55 : 1,
+                        opacity: done ? 0.5 : 1,
                         child: _fadeImage(item.image, onError: _brokenImage),
                       ),
                     ),
-                  ),
+                    // Soft dark fade so the glass badge is always readable.
+                    if (showBadge)
+                      Positioned(
+                        left: 0,
+                        right: 0,
+                        bottom: 0,
+                        height: 76,
+                        child: IgnorePointer(
+                          child: DecoratedBox(
+                            decoration: BoxDecoration(
+                              gradient: LinearGradient(
+                                begin: Alignment.topCenter,
+                                end: Alignment.bottomCenter,
+                                colors: [
+                                  Colors.transparent,
+                                  Colors.black.withValues(alpha: 0.55),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    if (done) Positioned(top: 10, left: 10, child: _donePill()),
+                    if (showBadge && item.wasSnoozed)
+                      Positioned(
+                        top: 10,
+                        right: 10,
+                        child: _snoozedTag(onImage: true),
+                      ),
+                    if (showBadge)
+                      Positioned(
+                        left: 10,
+                        right: 10,
+                        bottom: 10,
+                        child: Align(
+                          alignment: Alignment.centerLeft,
+                          child: _reminderBadge(
+                            reminder,
+                            repeats: item.repeat.repeats,
+                          ),
+                        ),
+                      ),
+                  ],
                 ),
-                if (done) Positioned(top: 8, left: 8, child: _donePill()),
-                // "Snoozed" is hidden once the snoozed reminder is missed.
-                if (reminder != null &&
-                    !done &&
-                    item.wasSnoozed &&
-                    !_isMissed(item))
-                  Positioned(top: 8, right: 8, child: _snoozedTag()),
-                if (reminder != null && !done)
-                  Positioned(
-                    left: 8,
-                    right: 8,
-                    bottom: 8,
-                    child: Align(
-                      alignment: Alignment.centerLeft,
-                      child: _reminderBadge(reminder),
-                    ),
-                  ),
-              ],
+              ),
             ),
           ),
-          const SizedBox(height: 10),
+          const SizedBox(height: 12),
           Text(
             item.title,
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: TextStyle(
               color: done ? _muted(0.5) : AppColors.text,
-              fontSize: 14,
+              fontSize: 14.5,
               fontWeight: FontWeight.w600,
+              letterSpacing: -0.1,
               decoration: done ? TextDecoration.lineThrough : null,
               decorationColor: _muted(0.5),
             ),
           ),
-          const SizedBox(height: 2),
-          // The badge on the image already shows the reminder.
-          _metaText(item, showWhen: false),
+          const SizedBox(height: 3),
+          _metaText(item),
         ],
       ),
     );
   }
 
   /// "Category" or "Category · Tomorrow" (reminder part is coloured).
-  /// The grid hides the reminder part, because its badge already shows it.
-  Widget _metaText(SavedItem item, {bool showWhen = true}) {
+  Widget _metaText(SavedItem item) {
     return Text.rich(
       TextSpan(
         style: TextStyle(color: _muted(0.6), fontSize: 12),
         children: [
           TextSpan(text: item.category),
-          if (showWhen && item.reminderDate != null) ...[
+          if (item.reminderDate != null) ...[
             const TextSpan(text: ' · '),
             TextSpan(
               text: _when(item.reminderDate!),
@@ -1395,24 +1930,28 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget _buildList(List<SavedItem> items) {
     return SliverPadding(
       padding: const EdgeInsets.symmetric(horizontal: 24),
-      sliver: SliverList.separated(
+      sliver: SliverList.builder(
         itemCount: items.length,
-        separatorBuilder: (_, _) =>
-            Divider(height: 1, thickness: 0.6, color: _muted(0.1)),
         itemBuilder: (context, index) {
           final item = items[index];
 
-          return Dismissible(
-            key: ValueKey(item.id),
-            direction: DismissDirection.endToStart,
-            onDismissed: (_) => _deleteItem(item),
-            background: Container(
-              alignment: Alignment.centerRight,
-              padding: const EdgeInsets.only(right: 20),
-              color: _overdueColor.withValues(alpha: 0.10),
-              child: const Icon(Icons.delete_outline, color: _overdueColor),
+          return Padding(
+            padding: const EdgeInsets.symmetric(vertical: 5),
+            child: Dismissible(
+              key: ValueKey(item.id),
+              direction: DismissDirection.endToStart,
+              onDismissed: (_) => _deleteItem(item),
+              background: Container(
+                alignment: Alignment.centerRight,
+                padding: const EdgeInsets.only(right: 22),
+                decoration: BoxDecoration(
+                  color: _overdueColor.withValues(alpha: 0.14),
+                  borderRadius: BorderRadius.circular(18),
+                ),
+                child: const Icon(Icons.delete_outline, color: _overdueColor),
+              ),
+              child: _listRow(item),
             ),
-            child: _listRow(item),
           );
         },
       ),
@@ -1422,59 +1961,63 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget _listRow(SavedItem item) {
     final done = item.isDone;
 
-    return InkWell(
-      onTap: () => _openScreenshot(item),
-      onLongPress: () => _showItemMenu(item),
-      child: Container(
-        color: AppColors.surface, // keeps swipe background hidden at rest
-        padding: const EdgeInsets.symmetric(vertical: 14),
-        child: Row(
-          children: [
-            ClipRRect(
-              borderRadius: BorderRadius.circular(10),
-              child: Opacity(
-                opacity: done ? 0.55 : 1,
-                child: _fadeImage(
-                  item.image,
-                  width: 54,
-                  height: 54,
-                  onError: () =>
-                      SizedBox(width: 54, height: 54, child: _brokenImage()),
+    return Material(
+      color: _muted(0.05),
+      borderRadius: BorderRadius.circular(18),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(18),
+        onTap: () => _openScreenshot(item),
+        onLongPress: () => _showItemMenu(item),
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Row(
+            children: [
+              ClipRRect(
+                borderRadius: BorderRadius.circular(13),
+                child: Opacity(
+                  opacity: done ? 0.55 : 1,
+                  child: _fadeImage(
+                    item.image,
+                    width: 58,
+                    height: 58,
+                    onError: () =>
+                        SizedBox(width: 58, height: 58, child: _brokenImage()),
+                  ),
                 ),
               ),
-            ),
-            const SizedBox(width: 14),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    item.title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      color: done ? _muted(0.5) : AppColors.text,
-                      fontSize: 15,
-                      fontWeight: FontWeight.w600,
-                      decoration: done ? TextDecoration.lineThrough : null,
-                      decorationColor: _muted(0.5),
-                    ),
-                  ),
-                  if (item.note.trim().isNotEmpty) ...[
-                    const SizedBox(height: 3),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
                     Text(
-                      item.note,
+                      item.title,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
-                      style: TextStyle(color: _muted(0.6), fontSize: 12.5),
+                      style: TextStyle(
+                        color: done ? _muted(0.5) : AppColors.text,
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
+                        decoration: done ? TextDecoration.lineThrough : null,
+                        decorationColor: _muted(0.5),
+                      ),
                     ),
+                    if (item.note.trim().isNotEmpty) ...[
+                      const SizedBox(height: 3),
+                      Text(
+                        item.note,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(color: _muted(0.6), fontSize: 12.5),
+                      ),
+                    ],
+                    const SizedBox(height: 3),
+                    _metaText(item),
                   ],
-                  const SizedBox(height: 3),
-                  _metaText(item),
-                ],
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
@@ -1490,287 +2033,65 @@ class _HomeScreenState extends State<HomeScreen> {
 
 // ───────────────────────── VIEWER ─────────────────────────
 
-class _ScreenshotViewer extends StatelessWidget {
-  const _ScreenshotViewer({required this.item});
+/// Full screen viewer. Swipe left or right to move between the screenshots
+/// of [items]. Pops with a [_ViewerResult] when an action button is pressed.
+class _ScreenshotViewer extends StatefulWidget {
+  const _ScreenshotViewer({required this.items, required this.initialIndex});
 
-  final SavedItem item;
-
-  static const _bg = Color(0xFF0E0E0E);
-  static const _cardColor = Color(0xFF181818);
+  final List<SavedItem> items;
+  final int initialIndex;
 
   @override
-  Widget build(BuildContext context) {
-    final size = MediaQuery.sizeOf(context);
-    final hPad = size.width >= 600 ? 32.0 : 24.0;
+  State<_ScreenshotViewer> createState() => _ScreenshotViewerState();
+}
 
-    return Scaffold(
-      backgroundColor: _bg,
-      body: Stack(
-        children: [
-          // Soft blurred copy of the screenshot behind everything.
-          Positioned.fill(child: _backdrop()),
+class _ScreenshotViewerState extends State<_ScreenshotViewer> {
+  late final PageController _controller = PageController(
+    initialPage: widget.initialIndex,
+  );
 
-          SafeArea(
-            // The card runs down to the bottom edge and adds its own inset.
-            bottom: false,
-            child: Column(
-              children: [
-                _topBar(context),
+  late int _index = widget.initialIndex;
 
-                // The image takes all the space the card does not need.
-                Expanded(
-                  child: Padding(
-                    padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
-                    child: Center(
-                      child: InteractiveViewer(
-                        minScale: 0.8,
-                        maxScale: 5,
-                        child: Hero(
-                          tag: _heroTag(item),
-                          child: ClipRRect(
-                            borderRadius: BorderRadius.circular(18),
-                            child: Image.file(
-                              item.image,
-                              fit: BoxFit.contain,
-                              errorBuilder: (_, _, _) => const Icon(
-                                Icons.broken_image_outlined,
-                                color: Colors.white54,
-                                size: 60,
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
+  /// True while the current image is zoomed in. Swiping is off then, so
+  /// panning the zoomed image does not turn the page.
+  bool _zoomed = false;
 
-                _infoCard(context, size, hPad),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
+  SavedItem get _item => widget.items[_index];
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
   }
 
-  // ───────────────────────── BACKDROP ─────────────────────────
-
-  Widget _backdrop() {
-    return Stack(
-      fit: StackFit.expand,
-      children: [
-        ImageFiltered(
-          imageFilter: ImageFilter.blur(
-            sigmaX: 40,
-            sigmaY: 40,
-            tileMode: TileMode.mirror,
-          ),
-          child: Image.file(
-            item.image,
-            fit: BoxFit.cover,
-            errorBuilder: (_, _, _) => const SizedBox.shrink(),
-          ),
-        ),
-        // Dark layer keeps the text readable whatever the image colours are.
-        Container(color: _bg.withValues(alpha: 0.74)),
-      ],
-    );
+  void _finish(_ScreenshotAction action) {
+    Navigator.pop(context, _ViewerResult(action, _item));
   }
 
-  // ───────────────────────── TOP BAR ─────────────────────────
-
-  Widget _topBar(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-      child: Row(
-        children: [
-          _roundButton(
-            icon: Icons.arrow_back_rounded,
-            tooltip: 'Back',
-            onTap: () => Navigator.pop(context),
-          ),
-          const Spacer(),
-          _roundButton(
-            icon: Icons.edit_outlined,
-            tooltip: 'Edit',
-            onTap: () => Navigator.pop(context, _ScreenshotAction.edit),
-          ),
-          const SizedBox(width: 10),
-          _roundButton(
-            icon: Icons.delete_outline_rounded,
-            tooltip: 'Delete',
-            tint: const Color(0xFFFF8A80),
-            onTap: () => Navigator.pop(context, _ScreenshotAction.delete),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _roundButton({
-    required IconData icon,
-    required String tooltip,
-    required VoidCallback onTap,
-    Color tint = Colors.white,
-  }) {
-    return Tooltip(
-      message: tooltip,
-      child: Material(
-        color: tint.withValues(alpha: 0.12),
-        shape: const CircleBorder(),
-        clipBehavior: Clip.antiAlias,
-        child: InkWell(
-          onTap: onTap,
-          child: SizedBox(
-            width: 44,
-            height: 44,
-            child: Center(child: Icon(icon, color: tint, size: 21)),
-          ),
-        ),
-      ),
-    );
-  }
-
-  // ───────────────────────── INFO CARD ─────────────────────────
-
-  Widget _infoCard(BuildContext context, Size size, double hPad) {
-    final bottomInset = MediaQuery.paddingOf(context).bottom;
-    final reminder = item.reminderDate;
-    final missed = _isMissed(item);
+  Widget _chip(IconData icon, String label, {Color? color}) {
+    final c = color ?? Colors.white70;
 
     return Container(
-      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
-        color: _cardColor.withValues(alpha: 0.94),
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
-        border: Border(
-          top: BorderSide(color: Colors.white.withValues(alpha: 0.06)),
-        ),
+        color: c.withValues(alpha: 0.16),
+        borderRadius: BorderRadius.circular(20),
       ),
-      // A very long note scrolls inside the card instead of pushing the
-      // image off the screen.
-      child: ConstrainedBox(
-        constraints: BoxConstraints(maxHeight: size.height * 0.5),
-        child: SingleChildScrollView(
-          padding: EdgeInsets.fromLTRB(hPad, 12, hPad, 24 + bottomInset),
-          child: Center(
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 800),
-              child: SizedBox(
-                width: double.infinity,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    // Small handle, purely decorative.
-                    Center(
-                      child: Container(
-                        width: 36,
-                        height: 4,
-                        decoration: BoxDecoration(
-                          color: Colors.white.withValues(alpha: 0.18),
-                          borderRadius: BorderRadius.circular(4),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 20),
-
-                    Text(
-                      item.title,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 22,
-                        fontWeight: FontWeight.w700,
-                        height: 1.25,
-                        letterSpacing: -0.2,
-                      ),
-                    ),
-
-                    if (item.note.trim().isNotEmpty) ...[
-                      const SizedBox(height: 10),
-                      Text(
-                        item.note,
-                        style: const TextStyle(
-                          color: Colors.white70,
-                          fontSize: 14.5,
-                          height: 1.55,
-                        ),
-                      ),
-                    ],
-
-                    const SizedBox(height: 18),
-
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        _chip(
-                          icon: CategoryStore.iconFor(item.category),
-                          label: item.category,
-                        ),
-                        if (item.isDone)
-                          _chip(
-                            icon: Icons.check_circle_outline_rounded,
-                            label: 'Done',
-                            color: AppColors.accent,
-                          ),
-                        if (reminder != null) ...[
-                          _chip(
-                            icon: Icons.calendar_today_rounded,
-                            label:
-                            '${_formatDate(reminder)} · ${_timeShort(reminder)}',
-                          ),
-                          _chip(
-                            icon: missed
-                                ? Icons.error_outline_rounded
-                                : Icons.notifications_active_outlined,
-                            label: missed ? 'Missed' : _when(reminder),
-                            color: _statusColor(reminder, missed),
-                          ),
-                        ],
-                      ],
-                    ),
-
-                    const SizedBox(height: 22),
-                    _actionRow(context),
-                  ],
-                ),
-              ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 13, color: c),
+          const SizedBox(width: 5),
+          Text(
+            label,
+            style: TextStyle(
+              color: c,
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
             ),
           ),
-        ),
-      ),
-    );
-  }
-
-  /// Snooze (only while a reminder is active) and Done / Mark not done.
-  Widget _actionRow(BuildContext context) {
-    final canSnooze = !item.isDone && item.reminderDate != null;
-
-    return Row(
-      children: [
-        if (canSnooze) ...[
-          Expanded(
-            child: _actionButton(
-              icon: Icons.snooze_rounded,
-              label: 'Snooze',
-              onTap: () => Navigator.pop(context, _ScreenshotAction.snooze),
-            ),
-          ),
-          const SizedBox(width: 12),
         ],
-        Expanded(
-          child: _actionButton(
-            icon: item.isDone ? Icons.undo_rounded : Icons.check_rounded,
-            label: item.isDone ? 'Mark not done' : 'Done',
-            filled: !item.isDone,
-            onTap: () => Navigator.pop(context, _ScreenshotAction.done),
-          ),
-        ),
-      ],
+      ),
     );
   }
 
@@ -1780,29 +2101,29 @@ class _ScreenshotViewer extends StatelessWidget {
     required VoidCallback onTap,
     bool filled = false,
   }) {
-    final foreground = filled ? Colors.white : AppColors.accent;
+    final fg = filled ? Colors.white : AppColors.accent;
 
     return Material(
       color: filled
           ? AppColors.accent
-          : AppColors.accent.withValues(alpha: 0.14),
-      borderRadius: BorderRadius.circular(14),
-      clipBehavior: Clip.antiAlias,
+          : AppColors.accent.withValues(alpha: 0.16),
+      borderRadius: BorderRadius.circular(16),
       child: InkWell(
+        borderRadius: BorderRadius.circular(16),
         onTap: onTap,
-        child: SizedBox(
-          height: 50,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 13),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Icon(icon, size: 19, color: foreground),
+              Icon(icon, size: 18, color: fg),
               const SizedBox(width: 8),
               Text(
                 label,
                 style: TextStyle(
-                  color: foreground,
-                  fontSize: 14.5,
-                  fontWeight: FontWeight.w600,
+                  color: fg,
+                  fontSize: 13.5,
+                  fontWeight: FontWeight.w700,
                 ),
               ),
             ],
@@ -1812,37 +2133,412 @@ class _ScreenshotViewer extends StatelessWidget {
     );
   }
 
-  Color _statusColor(DateTime reminder, bool missed) {
-    if (missed) return _overdueColor;
-    if (_daysUntil(reminder) <= 1) return AppColors.accent;
-    return Colors.white70;
+  /// "3 / 12" pill in the top bar.
+  Widget _counter() {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(20),
+      child: BackdropFilter(
+        filter: ImageFilter.blur(
+          sigmaX: 12,
+          sigmaY: 12,
+          tileMode: TileMode.clamp,
+        ),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.35),
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: Text(
+            '${_index + 1} / ${widget.items.length}',
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+              letterSpacing: 0.3,
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
-  Widget _chip({
-    required IconData icon,
-    required String label,
-    Color color = Colors.white70,
-  }) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.12),
-        borderRadius: BorderRadius.circular(20),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
+  @override
+  Widget build(BuildContext context) {
+    final isTablet = MediaQuery.sizeOf(context).width >= 600;
+    final item = _item;
+    final reminder = item.reminderDate;
+
+    Color whenColor = Colors.white70;
+    if (reminder != null) {
+      final diff = _daysUntil(reminder);
+      if (diff < 0) {
+        whenColor = _overdueColor;
+      } else if (diff <= 1) {
+        whenColor = AppColors.accent;
+      }
+    }
+
+    final pagePadding = EdgeInsets.only(
+      top: 70,
+      bottom: isTablet ? 290 : 310,
+      left: 18,
+      right: 18,
+    );
+
+    return Scaffold(
+      backgroundColor: const Color(0xFF0B0B0C),
+      body: Stack(
         children: [
-          Icon(icon, size: 14, color: color),
-          const SizedBox(width: 6),
-          Text(
-            label,
-            style: TextStyle(
-              color: color,
-              fontSize: 12.5,
-              fontWeight: FontWeight.w600,
+          // Blurred copy of the current photo as the backdrop.
+          Positioned.fill(
+            child: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 300),
+              child: KeyedSubtree(
+                key: ValueKey(item.id),
+                child: ClipRect(
+                  child: ImageFiltered(
+                    imageFilter: ImageFilter.blur(
+                      sigmaX: 45,
+                      sigmaY: 45,
+                      tileMode: TileMode.clamp,
+                    ),
+                    child: Opacity(
+                      opacity: 0.55,
+                      child: SizedBox.expand(
+                        child: Image.file(
+                          item.image,
+                          fit: BoxFit.cover,
+                          errorBuilder: (_, _, _) => const SizedBox.shrink(),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          Positioned.fill(
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [
+                    Colors.black.withValues(alpha: 0.25),
+                    Colors.black.withValues(alpha: 0.75),
+                  ],
+                ),
+              ),
+            ),
+          ),
+
+          SafeArea(
+            child: Stack(
+              children: [
+                // The swipeable photos.
+                Positioned.fill(
+                  child: PageView.builder(
+                    controller: _controller,
+                    itemCount: widget.items.length,
+                    physics: _zoomed
+                        ? const NeverScrollableScrollPhysics()
+                        : const PageScrollPhysics(),
+                    onPageChanged: (i) {
+                      HapticFeedback.selectionClick();
+                      setState(() {
+                        _index = i;
+                        _zoomed = false;
+                      });
+                    },
+                    itemBuilder: (context, i) => _ViewerPage(
+                      key: ValueKey(widget.items[i].id),
+                      item: widget.items[i],
+                      padding: pagePadding,
+                      onZoomChanged: (zoomed) {
+                        if (_zoomed != zoomed && i == _index) {
+                          setState(() => _zoomed = zoomed);
+                        }
+                      },
+                    ),
+                  ),
+                ),
+
+                // Top bar: back, counter, edit, delete.
+                Positioned(
+                  top: 8,
+                  left: 8,
+                  right: 8,
+                  child: Row(
+                    children: [
+                      _viewerButton(
+                        Icons.arrow_back,
+                        () => Navigator.pop(context),
+                      ),
+                      Expanded(
+                        child: Center(
+                          child: widget.items.length > 1
+                              ? _counter()
+                              : const SizedBox.shrink(),
+                        ),
+                      ),
+                      _viewerButton(
+                        Icons.edit_outlined,
+                        () => _finish(_ScreenshotAction.edit),
+                      ),
+                      _viewerButton(
+                        Icons.delete_outline,
+                        () => _finish(_ScreenshotAction.delete),
+                      ),
+                    ],
+                  ),
+                ),
+
+                // Info card of the current photo.
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                  child: _glass(
+                    radius: const BorderRadius.vertical(
+                      top: Radius.circular(28),
+                    ),
+                    sigma: 30,
+                    tint: const Color(0xFF16161A).withValues(alpha: 0.7),
+                    child: Padding(
+                      padding: EdgeInsets.fromLTRB(
+                        isTablet ? 32 : 24,
+                        12,
+                        isTablet ? 32 : 24,
+                        28,
+                      ),
+                      child: Center(
+                        child: ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 800),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Center(
+                                child: Container(
+                                  width: 38,
+                                  height: 4,
+                                  decoration: BoxDecoration(
+                                    color: Colors.white.withValues(alpha: 0.25),
+                                    borderRadius: BorderRadius.circular(2),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(height: 16),
+                              Text(
+                                item.title,
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 21,
+                                  fontWeight: FontWeight.w700,
+                                  letterSpacing: -0.4,
+                                  height: 1.3,
+                                ),
+                              ),
+                              if (item.note.trim().isNotEmpty) ...[
+                                const SizedBox(height: 8),
+                                Text(
+                                  item.note,
+                                  maxLines: 3,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: Colors.white70,
+                                    fontSize: 14,
+                                    height: 1.55,
+                                  ),
+                                ),
+                              ],
+                              const SizedBox(height: 16),
+                              Wrap(
+                                spacing: 8,
+                                runSpacing: 8,
+                                children: [
+                                  _chip(
+                                    Icons.label_outline_rounded,
+                                    item.category,
+                                  ),
+                                  if (reminder != null)
+                                    _chip(
+                                      Icons.event_rounded,
+                                      _formatDate(reminder),
+                                    ),
+                                  if (reminder != null)
+                                    _chip(
+                                      Icons.schedule_rounded,
+                                      _when(reminder),
+                                      color: whenColor,
+                                    ),
+                                  if (reminder != null && item.repeat.repeats)
+                                    _chip(
+                                      Icons.repeat_rounded,
+                                      'Repeats ${item.repeat.label.toLowerCase()}',
+                                      color: AppColors.accent,
+                                    ),
+                                ],
+                              ),
+                              const SizedBox(height: 18),
+                              Row(
+                                children: [
+                                  if (!item.isDone && reminder != null) ...[
+                                    Expanded(
+                                      child: _actionButton(
+                                        icon: Icons.snooze_rounded,
+                                        label: 'Snooze',
+                                        onTap: () =>
+                                            _finish(_ScreenshotAction.snooze),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 10),
+                                  ],
+                                  Expanded(
+                                    child: _actionButton(
+                                      icon: item.isDone
+                                          ? Icons.undo_rounded
+                                          : Icons.check_rounded,
+                                      label: item.isDone
+                                          ? 'Not done'
+                                          : (item.repeat.repeats
+                                                ? 'Done for now'
+                                                : 'Done'),
+                                      filled: true,
+                                      onTap: () =>
+                                          _finish(_ScreenshotAction.done),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  /// Round frosted button for the viewer's top bar.
+  Widget _viewerButton(IconData icon, VoidCallback onTap) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 4),
+      child: ClipOval(
+        child: BackdropFilter(
+          filter: ImageFilter.blur(
+            sigmaX: 12,
+            sigmaY: 12,
+            tileMode: TileMode.clamp,
+          ),
+          child: Material(
+            color: Colors.black.withValues(alpha: 0.35),
+            child: InkWell(
+              onTap: onTap,
+              child: SizedBox(
+                width: 44,
+                height: 44,
+                child: Icon(icon, color: Colors.white, size: 21),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// One photo of the viewer. Pinch to zoom, and it tells the viewer when it is
+/// zoomed so swiping can be switched off.
+class _ViewerPage extends StatefulWidget {
+  const _ViewerPage({
+    super.key,
+    required this.item,
+    required this.padding,
+    required this.onZoomChanged,
+  });
+
+  final SavedItem item;
+  final EdgeInsets padding;
+  final ValueChanged<bool> onZoomChanged;
+
+  @override
+  State<_ViewerPage> createState() => _ViewerPageState();
+}
+
+class _ViewerPageState extends State<_ViewerPage> {
+  final TransformationController _transform = TransformationController();
+  bool _zoomed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _transform.addListener(_onTransform);
+  }
+
+  @override
+  void dispose() {
+    _transform.removeListener(_onTransform);
+    _transform.dispose();
+    super.dispose();
+  }
+
+  void _onTransform() {
+    final zoomed = _transform.value.getMaxScaleOnAxis() > 1.02;
+    if (zoomed == _zoomed) return;
+
+    _zoomed = zoomed;
+    widget.onZoomChanged(zoomed);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final item = widget.item;
+
+    return Padding(
+      padding: widget.padding,
+      child: Center(
+        child: InteractiveViewer(
+          transformationController: _transform,
+          minScale: 0.8,
+          maxScale: 5,
+          child: Hero(
+            tag: _heroTag(item),
+            child: Container(
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(18),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.5),
+                    blurRadius: 30,
+                    offset: const Offset(0, 12),
+                  ),
+                ],
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(18),
+                child: Image.file(
+                  item.image,
+                  fit: BoxFit.contain,
+                  errorBuilder: (_, _, _) => const Icon(
+                    Icons.broken_image_outlined,
+                    color: Colors.white54,
+                    size: 60,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
       ),
     );
   }

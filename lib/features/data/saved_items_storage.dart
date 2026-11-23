@@ -96,7 +96,14 @@ class SavedItemsStorage {
 
   /// Returns every saved item. Waits for pending writes first, so the result
   /// is always up to date.
-  Future<List<SavedItem>> load() => _serial(_readAll);
+  /// Returns every saved item that is not in "Recently deleted". Waits for
+  /// pending writes first, so the result is always up to date.
+  Future<List<SavedItem>> load() {
+    return _serial(() async {
+      final all = await _readAll();
+      return all.where((e) => !e.isTrashed).toList();
+    });
+  }
 
   /// Adds [item] at [index] (default: top of the list).
   Future<void> insertItem(SavedItem item, {int index = 0}) {
@@ -119,14 +126,11 @@ class SavedItemsStorage {
     });
   }
 
-  /// Used by the snooze flow. Only changes the reminder date, so anything
-  /// else the user edited is kept.
   /// Used by the snooze flow. Changes the reminder date and marks the item
   /// as snoozed, so the UI can show a "Snoozed" label.
-  /// Used by the snooze flow. Changes the reminder date and marks the item
-  /// as snoozed, so the UI can show a "Snoozed" label.
-  /// Used by the snooze flow. Changes the reminder date and marks the item
-  /// as snoozed, so the UI can show a "Snoozed" label.
+  ///
+  /// The repeat series (repeat + repeatAnchor) is left alone, so a snooze
+  /// never moves a repeating reminder.
   Future<void> updateReminderDate(String itemId, DateTime date) {
     return _modify((items) {
       final i = items.indexWhere((e) => e.id == itemId);
@@ -147,7 +151,164 @@ class SavedItemsStorage {
     });
   }
 
+  // ───────────────────────── REPEATING REMINDERS ─────────────────────────
+
+  /// Moves every repeating reminder whose time has passed to its next time.
+  /// Returns true if anything changed. Repeating reminders therefore never
+  /// stay "Missed": they simply show the next time.
+  Future<bool> rollRepeating() {
+    return _serial(() async {
+      final items = await _readAll();
+      final now = DateTime.now();
+      var changed = false;
+
+      for (var i = 0; i < items.length; i++) {
+        final item = items[i];
+        final reminder = item.reminderDate;
+
+        if (!item.repeat.repeats ||
+            item.isTrashed ||
+            item.isDone ||
+            reminder == null ||
+            !reminder.isBefore(now)) {
+          continue;
+        }
+
+        final next = item.repeat.nextAfter(item.repeatAnchor ?? reminder, now);
+        if (next == null) continue;
+
+        items[i] = item.copyWith(reminderDate: next, wasSnoozed: false);
+        changed = true;
+      }
+
+      if (changed) await _writeAll(items);
+      return changed;
+    });
+  }
+
+  /// "Done" for a reminder.
+  /// - Repeating: moves it to its next time and returns the updated item.
+  /// - Not repeating: marks it done and returns null.
+  Future<SavedItem?> markDoneOrAdvance(String itemId) {
+    return _serial(() async {
+      final items = await _readAll();
+      final i = items.indexWhere((e) => e.id == itemId);
+      if (i == -1) return null;
+      if (items[i].isTrashed) return null;
+
+      final item = items[i];
+      final anchor = item.repeatAnchor ?? item.reminderDate;
+      final now = DateTime.now();
+      final reminder = item.reminderDate;
+      final from = (reminder != null && reminder.isAfter(now)) ? reminder : now;
+
+      final next = (item.repeat.repeats && anchor != null)
+          ? item.repeat.nextAfter(anchor, from)
+          : null;
+
+      if (next != null) {
+        items[i] = item.copyWith(reminderDate: next, wasSnoozed: false);
+        await _writeAll(items);
+        return items[i];
+      }
+
+      items[i] = item.copyWith(
+        isDone: true,
+        clearReminder: true,
+        repeat: RepeatRule.none,
+      );
+      await _writeAll(items);
+      return null;
+    });
+  }
+
   // ───────────────────────── IMAGES ─────────────────────────
+
+  // ───────────────────────── RECENTLY DELETED ─────────────────────────
+
+  /// How many days a deleted item stays in "Recently deleted".
+  static const trashKeepDays = 30;
+
+  /// Moves an item to "Recently deleted". Its image stays on the phone until
+  /// the item is removed for good.
+  Future<void> moveToTrash(String id) {
+    return _modify((items) {
+      final i = items.indexWhere((e) => e.id == id);
+      if (i == -1) return;
+
+      items[i] = items[i].copyWith(deletedAt: DateTime.now());
+    });
+  }
+
+  /// Takes an item out of "Recently deleted". It returns to its old place.
+  Future<void> restore(String id) {
+    return _modify((items) {
+      final i = items.indexWhere((e) => e.id == id);
+      if (i == -1) return;
+
+      items[i] = items[i].copyWith(clearDeleted: true);
+    });
+  }
+
+  /// Items in "Recently deleted", newest first.
+  Future<List<SavedItem>> loadDeleted() {
+    return _serial(() async {
+      final all = await _readAll();
+
+      return all.where((e) => e.isTrashed).toList()
+        ..sort((a, b) => b.deletedAt!.compareTo(a.deletedAt!));
+    });
+  }
+
+  /// Removes one item and its image for good.
+  Future<void> deletePermanently(String id) async {
+    SavedItem? removed;
+
+    await _modify((items) {
+      final i = items.indexWhere((e) => e.id == id);
+      if (i == -1) return;
+
+      removed = items.removeAt(i);
+    });
+
+    final gone = removed;
+    if (gone != null) await deleteImage(gone.image);
+  }
+
+  /// Removes everything in "Recently deleted" for good.
+  Future<void> emptyTrash() async {
+    final gone = <SavedItem>[];
+
+    await _modify((items) {
+      gone.addAll(items.where((e) => e.isTrashed));
+      items.removeWhere((e) => e.isTrashed);
+    });
+
+    for (final item in gone) {
+      await deleteImage(item.image);
+    }
+  }
+
+  /// Removes items that were deleted more than [trashKeepDays] days ago.
+  /// Returns how many were removed.
+  Future<int> purgeExpired() async {
+    final limit = DateTime.now().subtract(const Duration(days: trashKeepDays));
+    final gone = <SavedItem>[];
+
+    bool expired(SavedItem e) =>
+        e.deletedAt != null && e.deletedAt!.isBefore(limit);
+
+    await _modify((items) {
+      gone.addAll(items.where(expired));
+      items.removeWhere(expired);
+    });
+
+    for (final item in gone) {
+      await deleteImage(item.image);
+    }
+
+    return gone.length;
+  }
 
   /// Copies the picked screenshot into the app folder and returns the item
   /// pointing to the permanent copy. Throws if the copy fails.
@@ -181,15 +342,19 @@ class SavedItemsStorage {
     }
   }
 
-  /// Marks an item done (or not done). When done, its reminder is cleared,
-  /// so it no longer shows as upcoming or overdue.
+  /// Marks an item done (or not done). When done, its reminder is cleared and
+  /// it stops repeating, so it no longer shows as upcoming or overdue.
   Future<void> setDone(String itemId, bool done) {
     return _modify((items) {
       final i = items.indexWhere((e) => e.id == itemId);
       if (i == -1) return;
 
       items[i] = done
-          ? items[i].copyWith(isDone: true, clearReminder: true)
+          ? items[i].copyWith(
+              isDone: true,
+              clearReminder: true,
+              repeat: RepeatRule.none,
+            )
           : items[i].copyWith(isDone: false);
     });
   }

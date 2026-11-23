@@ -4,6 +4,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../theme/app_colors.dart';
 import 'notification_service.dart';
 
+import 'package:permission_handler/permission_handler.dart';
+
 const _explainedKey = 'permission_explained';
 
 enum ReminderPermission { granted, denied, skipped }
@@ -37,6 +39,64 @@ Future<ReminderPermission> ensureReminderPermission(
 
   final granted = await service.ensurePermissions();
   return granted ? ReminderPermission.granted : ReminderPermission.denied;
+}
+
+bool _settingsDialogShown = false;
+
+/// Tells the user notifications are off and offers to open the app settings.
+/// Shown once per app session, unless [force] is true (user tapped a button).
+Future<void> showNotificationSettingsDialog(
+  BuildContext context, {
+  bool force = false,
+}) async {
+  if (_settingsDialogShown && !force) return;
+  if (!context.mounted) return;
+
+  _settingsDialogShown = true;
+
+  await showDialog<void>(
+    context: context,
+    builder: (dialogContext) => AlertDialog(
+      backgroundColor: AppColors.surface,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+      title: Text(
+        'Notifications are off',
+        style: TextStyle(
+          color: AppColors.text,
+          fontSize: 17,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+      content: Text(
+        'Your reminder is saved, but SnapKeep cannot alert you until you '
+        'turn notifications on in Settings.',
+        style: TextStyle(
+          color: AppColors.secondaryText,
+          fontSize: 14,
+          height: 1.4,
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(dialogContext),
+          child: Text(
+            'Not now',
+            style: TextStyle(color: AppColors.secondaryText),
+          ),
+        ),
+        TextButton(
+          onPressed: () {
+            Navigator.pop(dialogContext);
+            openAppSettings();
+          },
+          child: Text(
+            'Open Settings',
+            style: TextStyle(color: AppColors.accent),
+          ),
+        ),
+      ],
+    ),
+  );
 }
 
 /// Explanation sheet. Returns true for "Allow", false or null otherwise.
