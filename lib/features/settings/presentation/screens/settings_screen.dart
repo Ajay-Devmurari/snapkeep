@@ -1,12 +1,9 @@
 import 'dart:math' as math;
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-
 import '../../../../core/theme/app_colors.dart';
 import '../../../../core/theme/theme_controller.dart';
 import '../../../../core/widgets/motion.dart';
-
 import 'package:snapkeep/features/data/saved_items_storage.dart';
 import 'package:snapkeep/features/trash/presentation/screens/recently_deleted_screen.dart';
 
@@ -71,7 +68,6 @@ class SettingsScreen extends StatelessWidget {
                     delay: Duration(milliseconds: 290),
                     child: _RecentlyDeletedTile(),
                   ),
-
                   const SizedBox(height: 30),
                   const FadeSlideIn(
                     delay: Duration(milliseconds: 260),
@@ -198,7 +194,7 @@ class _RecentlyDeletedTileState extends State<_RecentlyDeletedTile> {
                   const SizedBox(height: 2),
                   Text(
                     'Kept for ${SavedItemsStorage.trashKeepDays} days, then '
-                    'removed for good.',
+                        'removed for good.',
                     style: TextStyle(
                       color: AppColors.secondaryText,
                       fontSize: 12.5,
@@ -234,6 +230,7 @@ class _RecentlyDeletedTileState extends State<_RecentlyDeletedTile> {
     );
   }
 }
+
 // ───────────────────────── HERO CARD ─────────────────────────
 
 class _HeroCard extends StatefulWidget {
@@ -357,7 +354,7 @@ class _HeroCardState extends State<_HeroCard>
                         const SizedBox(height: 4),
                         Text(
                           'Screenshots you’ll need later, back right when '
-                          'you need them.',
+                              'you need them.',
                           style: TextStyle(
                             color: AppColors.secondaryText,
                             fontSize: 13,
@@ -406,12 +403,12 @@ class _ThemeCard extends StatelessWidget {
           ),
           boxShadow: selected
               ? [
-                  BoxShadow(
-                    color: AppColors.accent.withValues(alpha: 0.22),
-                    blurRadius: 18,
-                    offset: const Offset(0, 6),
-                  ),
-                ]
+            BoxShadow(
+              color: AppColors.accent.withValues(alpha: 0.22),
+              blurRadius: 18,
+              offset: const Offset(0, 6),
+            ),
+          ]
               : const [],
         ),
         child: Column(
@@ -446,13 +443,13 @@ class _ThemeCard extends StatelessWidget {
                   curve: Curves.easeOutCubic,
                   child: selected
                       ? Padding(
-                          padding: const EdgeInsets.only(left: 6),
-                          child: Icon(
-                            Icons.check_circle_rounded,
-                            size: 16,
-                            color: AppColors.accent,
-                          ),
-                        )
+                    padding: const EdgeInsets.only(left: 6),
+                    child: Icon(
+                      Icons.check_circle_rounded,
+                      size: 16,
+                      color: AppColors.accent,
+                    ),
+                  )
                       : const SizedBox.shrink(),
                 ),
               ],
@@ -556,7 +553,7 @@ class _AboutCard extends StatelessWidget {
             icon: Icons.phone_android_rounded,
             title: 'Stored on your phone',
             subtitle:
-                'Your screenshots and reminders stay only on this device.',
+            'Your screenshots and reminders stay only on this device.',
           ),
           Divider(height: 1, thickness: 0.6, color: AppColors.border),
           const _AboutRow(

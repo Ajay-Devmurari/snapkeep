@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:ui' show ImageFilter, TileMode;
+import 'dart:async';
 
 import 'package:snapkeep/core/notifications/snooze_sheet.dart';
 import 'package:flutter/material.dart';
@@ -19,7 +20,18 @@ import 'screenshot_details_screen.dart';
 
 enum _ViewMode { grid, list }
 
-enum _ScreenshotAction { edit, delete, done, snooze }
+enum _ScreenshotAction { edit, delete, done, snooze, stopRepeat }
+
+enum _SortMode { newest, reminder, title, category }
+
+extension on _SortMode {
+  String get label => switch (this) {
+    _SortMode.newest => 'Newest',
+    _SortMode.reminder => 'Reminder date',
+    _SortMode.title => 'Title A–Z',
+    _SortMode.category => 'Category',
+  };
+}
 
 /// What the viewer hands back: the action, and the item that was on screen.
 class _ViewerResult {
@@ -287,6 +299,10 @@ Widget _snoozedTag({bool onImage = false}) {
 }
 
 /// Round tinted icon button used in the header.
+
+/// Round icon button without the left padding, used in the select bar.
+
+/// Round tinted icon button used in the header.
 Widget _headerButton({
   required IconData icon,
   required String tooltip,
@@ -307,6 +323,30 @@ Widget _headerButton({
             height: 40,
             child: Icon(icon, size: 20, color: _muted(0.8)),
           ),
+        ),
+      ),
+    ),
+  );
+}
+
+/// Round icon button without the left padding, used in the select bar.
+Widget _plainIconButton({
+  required IconData icon,
+  required String tooltip,
+  required VoidCallback onPressed,
+}) {
+  return Tooltip(
+    message: tooltip,
+    child: Material(
+      color: _muted(0.07),
+      shape: const CircleBorder(),
+      child: InkWell(
+        customBorder: const CircleBorder(),
+        onTap: onPressed,
+        child: SizedBox(
+          width: 40,
+          height: 40,
+          child: Icon(icon, size: 20, color: _muted(0.8)),
         ),
       ),
     ),
@@ -339,6 +379,82 @@ Widget _sheetTile({
     ),
     onTap: onTap,
   );
+}
+
+/// Check circle shown on a card while selecting. Springs in when selected.
+Widget _selectMark(bool selected) {
+  return AnimatedScale(
+    scale: selected ? 1 : 0.85,
+    duration: const Duration(milliseconds: 220),
+    curve: Curves.easeOutBack,
+    child: AnimatedContainer(
+      duration: const Duration(milliseconds: 220),
+      width: 28,
+      height: 28,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        gradient: selected
+            ? LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [
+                  AppColors.accent,
+                  AppColors.accent.withValues(alpha: 0.75),
+                ],
+              )
+            : null,
+        color: selected ? null : Colors.black.withValues(alpha: 0.35),
+        border: Border.all(
+          color: selected ? Colors.transparent : Colors.white,
+          width: 2,
+        ),
+        boxShadow: [
+          BoxShadow(color: Colors.black.withValues(alpha: 0.3), blurRadius: 8),
+        ],
+      ),
+      child: AnimatedSwitcher(
+        duration: const Duration(milliseconds: 150),
+        transitionBuilder: (child, anim) =>
+            ScaleTransition(scale: anim, child: child),
+        child: selected
+            ? const Icon(
+                Icons.check_rounded,
+                key: ValueKey('on'),
+                size: 17,
+                color: Colors.white,
+              )
+            : const SizedBox(key: ValueKey('off')),
+      ),
+    ),
+  );
+}
+
+/// Saturation filter: 1 = normal colour, 0 = grayscale.
+ColorFilter _saturation(double s) {
+  const r = 0.2126, g = 0.7152, b = 0.0722;
+  final a = 1 - s;
+  return ColorFilter.matrix(<double>[
+    a * r + s,
+    a * g,
+    a * b,
+    0,
+    0,
+    a * r,
+    a * g + s,
+    a * b,
+    0,
+    0,
+    a * r,
+    a * g,
+    a * b + s,
+    0,
+    0,
+    0,
+    0,
+    0,
+    1,
+    0,
+  ]);
 }
 
 /// Big square option (Camera / Gallery) in the add sheet.
@@ -396,8 +512,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final ImagePicker _picker = ImagePicker();
   final List<SavedItem> _items = [];
   final TextEditingController _searchController = TextEditingController();
-
+  Timer? _pressTimer;
   String _selectedCategory = 'All';
+
+  // Sort (session only, not saved).
+  _SortMode _sortMode = _SortMode.newest;
+
+  // Multi-select.
+  bool _selectMode = false;
+  final Set<String> _selectedIds = {};
+
+  // The card currently being long-pressed (for the pop animation).
+  String? _pressedId;
+
   _ViewMode _viewMode = _ViewMode.grid;
 
   final SavedItemsStorage _storage = SavedItemsStorage.instance;
@@ -425,11 +552,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }).length;
   }
 
+  /// Selected items that are visible right now (search and category applied).
+  List<SavedItem> get _selectedItems =>
+      _filteredItems.where((i) => _selectedIds.contains(i.id)).toList();
+
   // Done items are hidden from every category except "Done".
   List<SavedItem> get _filteredItems {
     final query = _searchController.text.trim().toLowerCase();
 
-    return _items.where((item) {
+    final matched = _items.where((item) {
       final matchesCategory = switch (_selectedCategory) {
         'All' => !item.isDone,
         'Done' => item.isDone,
@@ -444,6 +575,51 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
       return matchesCategory && matchesSearch;
     }).toList();
+
+    return _sorted(matched);
+  }
+
+  /// Sorts the list. "Newest" keeps the stored order, because new items are
+  /// inserted at index 0. The viewer swipes in this same order.
+  List<SavedItem> _sorted(List<SavedItem> list) {
+    if (_sortMode == _SortMode.newest) return list;
+
+    // Original position, used to break ties so equal items keep their order.
+    final rank = {for (var i = 0; i < list.length; i++) list[i].id: i};
+    int byNewest(SavedItem a, SavedItem b) =>
+        rank[a.id]!.compareTo(rank[b.id]!);
+
+    final sorted = List<SavedItem>.of(list);
+
+    switch (_sortMode) {
+      case _SortMode.newest:
+        break;
+      case _SortMode.reminder:
+        sorted.sort((a, b) {
+          final ra = a.reminderDate;
+          final rb = b.reminderDate;
+          // Items without a reminder go last.
+          if (ra == null && rb == null) return byNewest(a, b);
+          if (ra == null) return 1;
+          if (rb == null) return -1;
+          final c = ra.compareTo(rb);
+          return c != 0 ? c : byNewest(a, b);
+        });
+      case _SortMode.title:
+        sorted.sort((a, b) {
+          final c = a.title.toLowerCase().compareTo(b.title.toLowerCase());
+          return c != 0 ? c : byNewest(a, b);
+        });
+      case _SortMode.category:
+        sorted.sort((a, b) {
+          final c = a.category.toLowerCase().compareTo(
+            b.category.toLowerCase(),
+          );
+          return c != 0 ? c : byNewest(a, b);
+        });
+    }
+
+    return sorted;
   }
 
   /// Every active reminder that is missed or within the next 7 days.
@@ -493,6 +669,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     NotificationService.changes.removeListener(_onExternalChange);
     CategoryStore.categories.removeListener(_onCategoriesChanged);
+    _pressTimer?.cancel();
     _searchController.dispose();
     super.dispose();
   }
@@ -586,22 +763,37 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       );
   }
 
-  void _showMessage(String message) {
+  /// One toast helper. It always closes itself after [duration], even with an
+  /// action button, because the timer is ours and not only Flutter's.
+  void _toast(
+    String message, {
+    Duration duration = const Duration(seconds: 3),
+    String? actionLabel,
+    VoidCallback? onAction,
+  }) {
     if (!mounted) return;
 
-    ScaffoldMessenger.of(context)
-      ..clearSnackBars()
-      ..showSnackBar(
-        SnackBar(
-          behavior: SnackBarBehavior.floating,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(14),
-          ),
-          duration: const Duration(seconds: 3),
-          content: Text(message),
-        ),
-      );
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.hideCurrentSnackBar();
+
+    final controller = messenger.showSnackBar(
+      SnackBar(
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        duration: const Duration(seconds: 30),
+        persist: false,
+        dismissDirection: DismissDirection.horizontal,
+        content: Text(message),
+        action: actionLabel == null
+            ? null
+            : SnackBarAction(label: actionLabel, onPressed: onAction ?? () {}),
+      ),
+    );
+
+    Future.delayed(duration, () => controller.close());
   }
+
+  void _showMessage(String message) => _toast(message);
 
   /// Runs a storage write. On failure, shows [message] with the error.
   Future<void> _runStorage(
@@ -998,6 +1190,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     await NotificationService.instance.cancel(item);
 
+    // Nothing left to select after a delete.
+    if (_selectMode) {
+      setState(() {
+        _selectedIds.remove(item.id);
+        if (_selectedIds.isEmpty) _selectMode = false;
+      });
+    }
+
     await _runStorage(
       () => _storage.moveToTrash(item.id),
       'Could not delete the item.',
@@ -1005,40 +1205,122 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     if (!mounted) return;
 
-    ScaffoldMessenger.of(context)
-      ..clearSnackBars()
-      ..showSnackBar(
-        SnackBar(
-          behavior: SnackBarBehavior.floating,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(14),
-          ),
-          duration: const Duration(seconds: 5),
-          // A snackbar with an action does not hide by itself by default.
-          persist: false,
-          // Swipe left or right to dismiss.
-          dismissDirection: DismissDirection.horizontal,
-          content: const Text('Moved to Recently deleted'),
-          action: SnackBarAction(
-            label: 'Undo',
-            onPressed: () async {
-              await _runStorage(
-                () => _storage.restore(item.id),
-                'Could not restore the item.',
-              );
-              if (!mounted) return;
+    _toast(
+      'Moved to Recently deleted',
+      duration: const Duration(seconds: 5),
+      actionLabel: 'Undo',
+      onAction: () => _undoDelete(item),
+    );
+  }
 
-              // The item comes back to its old place in the list.
-              await _reloadList();
-              _syncReminder(item, askPermission: false);
-            },
-          ),
-        ),
-      );
+  Future<void> _undoDelete(SavedItem item) async {
+    await _runStorage(
+      () => _storage.restore(item.id),
+      'Could not restore the item.',
+    );
+    if (!mounted) return;
+
+    await _reloadList();
+    _syncReminder(item, askPermission: false);
+  }
+
+  /// Moves all selected items to "Recently deleted". One Undo brings them back.
+  Future<void> _deleteSelected() async {
+    final targets = _selectedItems;
+    if (targets.isEmpty) return;
+
+    HapticFeedback.mediumImpact();
+    final ids = targets.map((e) => e.id).toSet();
+
+    setState(() {
+      _items.removeWhere((e) => ids.contains(e.id));
+      _selectMode = false;
+      _selectedIds.clear();
+    });
+
+    for (final item in targets) {
+      await NotificationService.instance.cancel(item);
+    }
+
+    await _runStorage(() async {
+      for (final item in targets) {
+        await _storage.moveToTrash(item.id);
+      }
+    }, 'Could not delete the items.');
+
+    if (!mounted) return;
+
+    _toast(
+      '${targets.length} moved to Recently deleted',
+      duration: const Duration(seconds: 5),
+      actionLabel: 'Undo',
+      onAction: () => _undoBulk(targets),
+    );
+  }
+
+  Future<void> _undoBulk(List<SavedItem> targets) async {
+    await _runStorage(() async {
+      for (final item in targets) {
+        await _storage.restore(item.id);
+      }
+    }, 'Could not restore the items.');
+
+    if (!mounted) return;
+    await _reloadList();
+
+    for (final item in targets) {
+      _syncReminder(item, askPermission: false);
+    }
+  }
+
+  /// Done for every selected active item. Repeating items move to their next
+  /// time, the rest are marked done. Items that are already done are skipped.
+  Future<void> _doneSelected() async {
+    final targets = _selectedItems.where((i) => !i.isDone).toList();
+    _exitSelect();
+
+    if (targets.isEmpty) return;
+
+    final repeating = targets.where((i) => i.repeat.repeats).length;
+
+    for (final item in targets) {
+      await _toggleDone(item);
+    }
+
+    if (!mounted) return;
+
+    _showMessage(
+      repeating == 0
+          ? '${targets.length} items done'
+          : '${targets.length - repeating} done, '
+                '$repeating will remind again',
+    );
+  }
+
+  /// Snoozes every selected item that has an active reminder.
+  Future<void> _snoozeSelected() async {
+    final targets = _selectedItems
+        .where((i) => !i.isDone && i.reminderDate != null)
+        .toList();
+    if (targets.isEmpty) return;
+
+    final picked = await showSnoozeSheet(context);
+    if (picked == null || !mounted) return;
+
+    for (final item in targets) {
+      await NotificationService.instance.snoozeItem(item, picked);
+    }
+
+    _exitSelect();
+    _showMessage(
+      targets.length == 1
+          ? 'Snoozed until ${_timeShort(picked)}'
+          : 'Snoozed ${targets.length} items until ${_timeShort(picked)}',
+    );
   }
 
   /// Opens the viewer on [item]. The viewer can swipe through the same list
-  /// that the home screen shows (category and search applied).
+  /// that the home screen shows (category, search and sort applied).
   Future<void> _openScreenshot(SavedItem item) async {
     final visible = _filteredItems;
     var start = visible.indexWhere((e) => e.id == item.id);
@@ -1083,59 +1365,82 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         final picked = await showSnoozeSheet(context);
         if (picked == null || !mounted) return;
 
-        await NotificationService.instance.snoozeItem(current, picked);
-        _showMessage('Snoozed until ${_timeShort(picked)}');
+      case _ScreenshotAction.stopRepeat:
+        await _toggleDone(current, finish: true);
+        _showMessage('Stopped repeating. Marked as done.');
     }
   }
 
-  void _showItemMenu(SavedItem item) {
-    HapticFeedback.selectionClick();
+  // ───────────────────────── MULTI-SELECT ─────────────────────────
 
-    _showGlassSheet(
-      (sheetContext) => Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          _sheetTile(
-            icon: Icons.edit_outlined,
-            title: 'Edit',
-            onTap: () {
-              Navigator.pop(sheetContext);
-              _editItem(item);
-            },
-          ),
-          _sheetTile(
-            icon: item.isDone
-                ? Icons.undo_rounded
-                : Icons.check_circle_outline_rounded,
-            title: item.isDone
-                ? 'Mark as not done'
-                : (item.repeat.repeats ? 'Done for this time' : 'Mark as done'),
-            onTap: () {
-              Navigator.pop(sheetContext);
-              _toggleDone(item);
-            },
-          ),
-          if (item.repeat.repeats && !item.isDone)
-            _sheetTile(
-              icon: Icons.stop_circle_outlined,
-              title: 'Finish and stop repeating',
-              onTap: () {
-                Navigator.pop(sheetContext);
-                _toggleDone(item, finish: true);
-              },
-            ),
-          _sheetTile(
-            icon: Icons.delete_outline,
-            title: 'Delete',
-            color: _overdueColor,
-            onTap: () {
-              Navigator.pop(sheetContext);
-              _deleteItem(item);
-            },
-          ),
-        ],
-      ),
-    );
+  void _enterSelect(SavedItem item) {
+    HapticFeedback.selectionClick();
+    setState(() {
+      _selectMode = true;
+      _selectedIds
+        ..clear()
+        ..add(item.id);
+    });
+  }
+
+  void _exitSelect() {
+    if (!_selectMode) return;
+    _pressTimer?.cancel();
+    setState(() {
+      _selectMode = false;
+      _selectedIds.clear();
+      _pressedId = null;
+    });
+  }
+
+  void _toggleSelected(SavedItem item) {
+    HapticFeedback.selectionClick();
+    setState(() {
+      if (!_selectedIds.remove(item.id)) _selectedIds.add(item.id);
+    });
+  }
+
+  void _selectAllVisible() {
+    final visible = _filteredItems;
+    setState(() {
+      final allOn = visible.every((i) => _selectedIds.contains(i.id));
+      _selectedIds.clear();
+      if (!allOn) _selectedIds.addAll(visible.map((i) => i.id));
+    });
+  }
+
+  /// Tap: toggles while selecting, otherwise opens the viewer.
+  void _onItemTap(SavedItem item) {
+    if (_selectMode) {
+      _toggleSelected(item);
+    } else {
+      _openScreenshot(item);
+    }
+  }
+
+  /// Long press: the card springs down, then selection mode opens with
+  /// this item selected. While selecting, it toggles like a tap.
+  /// Long press: the card springs down, then selection mode opens with this
+  /// item selected. While selecting, it toggles like a tap.
+  void _onItemLongPress(SavedItem item) {
+    if (_selectMode) {
+      _toggleSelected(item);
+      return;
+    }
+
+    HapticFeedback.mediumImpact();
+    _pressTimer?.cancel();
+    setState(() => _pressedId = item.id);
+
+    _pressTimer = Timer(const Duration(milliseconds: 120), () {
+      if (!mounted) return;
+      setState(() => _pressedId = null);
+
+      // Only open selection if the item still exists.
+      if (_items.any((i) => i.id == item.id)) {
+        _enterSelect(item);
+      }
+    });
   }
 
   // ───────────────────────── BUILD ─────────────────────────
@@ -1144,71 +1449,93 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     final items = _filteredItems;
 
-    return Scaffold(
-      backgroundColor: AppColors.surface,
-      body: SafeArea(
-        child: Center(
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 950),
-            child: CustomScrollView(
-              slivers: [
-                SliverToBoxAdapter(child: _buildTopBar()),
-                // Shown only when notifications are off.
-                SliverToBoxAdapter(child: _buildNotificationBanner()),
-                SliverToBoxAdapter(child: _buildSearch()),
-                SliverToBoxAdapter(child: _buildCategories()),
-                SliverToBoxAdapter(child: _buildUpcoming()),
-                SliverToBoxAdapter(child: _buildCount(items.length)),
-                if (_loading)
-                  const SliverFillRemaining(
-                    hasScrollBody: false,
-                    child: Center(
-                      child: SizedBox(
-                        width: 24,
-                        height: 24,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      ),
+    return PopScope(
+      // Back first closes the selection, then leaves the screen.
+      canPop: !_selectMode,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _exitSelect();
+      },
+      child: Scaffold(
+        backgroundColor: AppColors.surface,
+        body: SafeArea(
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 950),
+              child: CustomScrollView(
+                slivers: [
+                  // FIXED: pinned so the top bar / select bar never scrolls
+                  // away, in normal mode and while selecting.
+                  SliverPersistentHeader(
+                    pinned: true,
+                    delegate: _FixedHeaderDelegate(
+                      height: _selectMode ? 76 : 64,
+                      child: _selectMode ? _buildSelectBar() : _buildTopBar(),
                     ),
-                  )
-                else if (items.isEmpty)
-                  SliverFillRemaining(
-                    hasScrollBody: false,
-                    child: _buildEmptyState(),
-                  )
-                else if (_viewMode == _ViewMode.grid)
-                  _buildGrid(items)
-                else
-                  _buildList(items),
-                const SliverToBoxAdapter(child: SizedBox(height: 120)),
-              ],
+                  ),
+                  SliverToBoxAdapter(child: _buildNotificationBanner()),
+                  // Search, chips and "Coming up" are hidden while selecting,
+                  // so the focus stays on the items.
+                  if (!_selectMode) ...[
+                    SliverToBoxAdapter(child: _buildSearch()),
+                    SliverToBoxAdapter(child: _buildCategories()),
+                    SliverToBoxAdapter(child: _buildUpcoming()),
+                  ],
+                  SliverToBoxAdapter(child: _buildCount(items.length)),
+                  if (_loading)
+                    const SliverFillRemaining(
+                      hasScrollBody: false,
+                      child: Center(
+                        child: SizedBox(
+                          width: 24,
+                          height: 24,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                      ),
+                    )
+                  else if (items.isEmpty)
+                    SliverFillRemaining(
+                      hasScrollBody: false,
+                      child: _buildEmptyState(),
+                    )
+                  else if (_viewMode == _ViewMode.grid)
+                    _buildGrid(items)
+                  else
+                    _buildList(items),
+                  const SliverToBoxAdapter(child: SizedBox(height: 120)),
+                ],
+              ),
             ),
           ),
         ),
-      ),
-      floatingActionButton: Container(
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(20),
-          boxShadow: [
-            BoxShadow(
-              color: AppColors.accent.withValues(alpha: 0.35),
-              blurRadius: 20,
-              offset: const Offset(0, 8),
-            ),
-          ],
-        ),
-        child: FloatingActionButton(
-          onPressed: _showAddSheet,
-          backgroundColor: AppColors.accent,
-          foregroundColor: Colors.white,
-          elevation: 0,
-          focusElevation: 0,
-          hoverElevation: 0,
-          highlightElevation: 0,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(20),
-          ),
-          child: const Icon(Icons.add_rounded, size: 28),
-        ),
+        bottomNavigationBar: _selectMode ? _buildSelectActions() : null,
+        // The add button is hidden while selecting.
+        floatingActionButton: _selectMode
+            ? null
+            : Container(
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(20),
+                  boxShadow: [
+                    BoxShadow(
+                      color: AppColors.accent.withValues(alpha: 0.35),
+                      blurRadius: 20,
+                      offset: const Offset(0, 8),
+                    ),
+                  ],
+                ),
+                child: FloatingActionButton(
+                  onPressed: _showAddSheet,
+                  backgroundColor: AppColors.accent,
+                  foregroundColor: Colors.white,
+                  elevation: 0,
+                  focusElevation: 0,
+                  hoverElevation: 0,
+                  highlightElevation: 0,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: const Icon(Icons.add_rounded, size: 28),
+                ),
+              ),
       ),
     );
   }
@@ -1275,6 +1602,231 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ).push(MaterialPageRoute(builder: (_) => const SettingsScreen())),
           ),
         ],
+      ),
+    );
+  }
+
+  /// Frosted top bar while selecting: close, animated count, select all.
+  /// Pinned by the sliver header, so it stays on top while scrolling.
+  Widget _buildSelectBar() {
+    final visible = _filteredItems;
+    final allOn =
+        visible.isNotEmpty && visible.every((i) => _selectedIds.contains(i.id));
+    final count = _selectedItems.length;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+      child: _glass(
+        radius: BorderRadius.circular(22),
+        sigma: 24,
+        tint: AppColors.surface.withValues(alpha: 0.92),
+        borderColor: AppColors.accent.withValues(alpha: 0.22),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+          child: Row(
+            children: [
+              _plainIconButton(
+                icon: Icons.close_rounded,
+                tooltip: 'Cancel',
+                onPressed: _exitSelect,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 180),
+                  transitionBuilder: (child, anim) => FadeTransition(
+                    opacity: anim,
+                    child: SlideTransition(
+                      position: Tween<Offset>(
+                        begin: const Offset(0, 0.25),
+                        end: Offset.zero,
+                      ).animate(anim),
+                      child: child,
+                    ),
+                  ),
+                  child: Text(
+                    count == 0 ? 'Select items' : '$count selected',
+                    key: ValueKey(count),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: AppColors.text,
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: -0.2,
+                    ),
+                  ),
+                ),
+              ),
+              TextButton(
+                onPressed: _selectAllVisible,
+                style: TextButton.styleFrom(
+                  foregroundColor: AppColors.accent,
+                  textStyle: const TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                child: Text(allOn ? 'Clear' : 'Select all'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Floating glass dock while selecting: Snooze, Done, Delete and "+".
+  Widget _buildSelectActions() {
+    final count = _selectedItems.length;
+    final canDone = _selectedItems.any((i) => !i.isDone);
+    final canSnooze = _selectedItems.any(
+      (i) => !i.isDone && i.reminderDate != null,
+    );
+
+    return SafeArea(
+      top: false,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+        child: _glass(
+          radius: BorderRadius.circular(28),
+          sigma: 24,
+          tint: AppColors.surface.withValues(alpha: 0.92),
+          borderColor: AppColors.accent.withValues(alpha: 0.2),
+          child: Padding(
+            padding: const EdgeInsets.all(8),
+            child: Row(
+              children: [
+                if (canSnooze) ...[
+                  _dockIconButton(
+                    icon: Icons.snooze_rounded,
+                    tooltip: 'Snooze',
+                    onTap: _snoozeSelected,
+                  ),
+                  const SizedBox(width: 6),
+                ],
+                Expanded(
+                  child: _dockButton(
+                    icon: Icons.check_rounded,
+                    label: count == 0 ? 'Done' : 'Done · $count',
+                    onTap: canDone ? _doneSelected : null,
+                    primary: true,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: _dockButton(
+                    icon: Icons.delete_outline_rounded,
+                    label: count == 0 ? 'Delete' : 'Delete · $count',
+                    onTap: count > 0 ? _deleteSelected : null,
+                    danger: true,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Material(
+                  color: AppColors.accent.withValues(alpha: 0.14),
+                  shape: const CircleBorder(),
+                  child: InkWell(
+                    customBorder: const CircleBorder(),
+                    onTap: () {
+                      _exitSelect();
+                      _showAddSheet();
+                    },
+                    child: SizedBox(
+                      width: 50,
+                      height: 50,
+                      child: Icon(
+                        Icons.add_rounded,
+                        size: 26,
+                        color: AppColors.accent,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Small round icon button used inside the selection dock.
+  Widget _dockIconButton({
+    required IconData icon,
+    required String tooltip,
+    required VoidCallback onTap,
+  }) {
+    return Tooltip(
+      message: tooltip,
+      child: Material(
+        color: AppColors.accent.withValues(alpha: 0.14),
+        shape: const CircleBorder(),
+        child: InkWell(
+          customBorder: const CircleBorder(),
+          onTap: onTap,
+          child: SizedBox(
+            width: 50,
+            height: 50,
+            child: Icon(icon, size: 22, color: AppColors.accent),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _dockButton({
+    required IconData icon,
+    required String label,
+    required VoidCallback? onTap,
+    bool primary = false,
+    bool danger = false,
+  }) {
+    final enabled = onTap != null;
+    final base = danger ? _overdueColor : AppColors.accent;
+
+    final Color fg;
+    final Color bg;
+
+    if (!enabled) {
+      fg = _muted(0.35);
+      bg = _muted(0.05);
+    } else if (primary) {
+      fg = Colors.white;
+      bg = base;
+    } else {
+      fg = base;
+      bg = base.withValues(alpha: 0.14);
+    }
+
+    return Material(
+      color: bg,
+      borderRadius: BorderRadius.circular(20),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(20),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 6),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, size: 18, color: fg),
+              const SizedBox(width: 6),
+              Flexible(
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: fg,
+                    fontSize: 13.5,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -1406,7 +1958,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 behavior: HitTestBehavior.opaque,
                 onTap: () {
                   HapticFeedback.selectionClick();
-                  setState(() => _selectedCategory = category);
+                  setState(() {
+                    _selectedCategory = category;
+                    _selectMode = false;
+                    _selectedIds.clear();
+                  });
                 },
                 child: AnimatedContainer(
                   duration: const Duration(milliseconds: 200),
@@ -1553,7 +2109,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     return InkWell(
       borderRadius: BorderRadius.circular(20),
-      onTap: () => _openScreenshot(item),
+      onTap: () => _onItemTap(item),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
         child: Row(
@@ -1694,14 +2250,66 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Widget _buildCount(int count) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(24, 24, 24, 14),
-      child: Text(
-        count == 1 ? '1 item' : '$count items',
-        style: TextStyle(
-          color: _muted(0.5),
-          fontSize: 12.5,
-          fontWeight: FontWeight.w500,
-          letterSpacing: 0.2,
+      child: Row(
+        children: [
+          Text(
+            count == 1 ? '1 item' : '$count items',
+            style: TextStyle(
+              color: _muted(0.5),
+              fontSize: 12.5,
+              fontWeight: FontWeight.w500,
+              letterSpacing: 0.2,
+            ),
+          ),
+          const Spacer(),
+          _sortPill(),
+        ],
+      ),
+    );
+  }
+
+  Widget _sortPill() {
+    return InkWell(
+      borderRadius: BorderRadius.circular(20),
+      onTap: _showSortSheet,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        decoration: BoxDecoration(
+          color: _muted(0.06),
+          borderRadius: BorderRadius.circular(20),
         ),
+        child: Text(
+          '${_sortMode.label} ▾',
+          style: TextStyle(
+            color: _muted(0.75),
+            fontSize: 12.5,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showSortSheet() {
+    HapticFeedback.selectionClick();
+
+    _showGlassSheet(
+      (sheetContext) => Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          for (final mode in _SortMode.values)
+            _sheetTile(
+              icon: mode == _sortMode
+                  ? Icons.check_rounded
+                  : Icons.sort_rounded,
+              title: mode.label,
+              color: mode == _sortMode ? AppColors.accent : null,
+              onTap: () {
+                Navigator.pop(sheetContext);
+                setState(() => _sortMode = mode);
+              },
+            ),
+        ],
       ),
     );
   }
@@ -1800,82 +2408,152 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final done = item.isDone;
     final reminder = item.reminderDate;
     final showBadge = reminder != null && !done;
+    final selected = _selectedIds.contains(item.id);
+    final dimmed = _selectMode && !selected;
+    final pressed = _pressedId == item.id;
 
     return GestureDetector(
-      onTap: () => _openScreenshot(item),
-      onLongPress: () => _showItemMenu(item),
+      onTap: () => _onItemTap(item),
+      onLongPress: () => _onItemLongPress(item),
       behavior: HitTestBehavior.opaque,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Expanded(
-            child: Container(
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(20),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withValues(alpha: 0.2),
-                    blurRadius: 18,
-                    offset: const Offset(0, 8),
+            child: AnimatedScale(
+              // Long-pressed card springs down, selected card stays small.
+              scale: pressed ? 0.9 : (selected ? 0.93 : 1),
+              duration: Duration(milliseconds: pressed ? 90 : 220),
+              curve: pressed ? Curves.easeOut : Curves.easeOutBack,
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 220),
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(22),
+                  border: Border.all(
+                    color: selected ? AppColors.accent : Colors.transparent,
+                    width: 2.5,
                   ),
-                ],
-              ),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(20),
-                child: Stack(
-                  fit: StackFit.expand,
-                  children: [
-                    // Done items are faded so active reminders stand out.
-                    Hero(
-                      tag: _heroTag(item),
-                      child: Opacity(
-                        opacity: done ? 0.5 : 1,
-                        child: _fadeImage(item.image, onError: _brokenImage),
-                      ),
-                    ),
-                    // Soft dark fade so the glass badge is always readable.
-                    if (showBadge)
-                      Positioned(
-                        left: 0,
-                        right: 0,
-                        bottom: 0,
-                        height: 76,
-                        child: IgnorePointer(
-                          child: DecoratedBox(
-                            decoration: BoxDecoration(
-                              gradient: LinearGradient(
-                                begin: Alignment.topCenter,
-                                end: Alignment.bottomCenter,
-                                colors: [
-                                  Colors.transparent,
-                                  Colors.black.withValues(alpha: 0.55),
-                                ],
-                              ),
+                  boxShadow: selected
+                      ? [
+                          BoxShadow(
+                            color: AppColors.accent.withValues(alpha: 0.4),
+                            blurRadius: 18,
+                            spreadRadius: 1,
+                          ),
+                        ]
+                      : [
+                          BoxShadow(
+                            color: Colors.black.withValues(alpha: 0.2),
+                            blurRadius: 18,
+                            offset: const Offset(0, 8),
+                          ),
+                        ],
+                ),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(20),
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      Hero(
+                        tag: _heroTag(item),
+                        // Unselected photos fade towards grayscale.
+                        child: TweenAnimationBuilder<double>(
+                          tween: Tween(begin: 1, end: dimmed ? 0.0 : 1.0),
+                          duration: const Duration(milliseconds: 220),
+                          builder: (context, s, child) => ColorFiltered(
+                            colorFilter: _saturation(s),
+                            child: child,
+                          ),
+                          child: AnimatedOpacity(
+                            duration: const Duration(milliseconds: 220),
+                            opacity: done ? 0.5 : (dimmed ? 0.45 : 1),
+                            child: _fadeImage(
+                              item.image,
+                              onError: _brokenImage,
                             ),
                           ),
                         ),
                       ),
-                    if (done) Positioned(top: 10, left: 10, child: _donePill()),
-                    if (showBadge && item.wasSnoozed)
-                      Positioned(
-                        top: 10,
-                        right: 10,
-                        child: _snoozedTag(onImage: true),
-                      ),
-                    if (showBadge)
-                      Positioned(
-                        left: 10,
-                        right: 10,
-                        bottom: 10,
-                        child: Align(
-                          alignment: Alignment.centerLeft,
-                          child: _reminderBadge(
-                            reminder,
-                            repeats: item.repeat.repeats,
+                      // Dark scrim on unselected cards while selecting.
+                      if (dimmed)
+                        Positioned.fill(
+                          child: IgnorePointer(
+                            child: DecoratedBox(
+                              decoration: BoxDecoration(
+                                color: Colors.black.withValues(alpha: 0.25),
+                              ),
+                            ),
                           ),
                         ),
-                      ),
-                  ],
+                      // Accent tint on the selected photo.
+                      if (selected)
+                        Positioned.fill(
+                          child: IgnorePointer(
+                            child: DecoratedBox(
+                              decoration: BoxDecoration(
+                                gradient: LinearGradient(
+                                  begin: Alignment.topLeft,
+                                  end: Alignment.bottomRight,
+                                  colors: [
+                                    AppColors.accent.withValues(alpha: 0.32),
+                                    Colors.transparent,
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      if (showBadge)
+                        Positioned(
+                          left: 0,
+                          right: 0,
+                          bottom: 0,
+                          height: 76,
+                          child: IgnorePointer(
+                            child: DecoratedBox(
+                              decoration: BoxDecoration(
+                                gradient: LinearGradient(
+                                  begin: Alignment.topCenter,
+                                  end: Alignment.bottomCenter,
+                                  colors: [
+                                    Colors.transparent,
+                                    Colors.black.withValues(alpha: 0.55),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      if (done)
+                        Positioned(top: 10, left: 10, child: _donePill()),
+                      if (showBadge && item.wasSnoozed && !_selectMode)
+                        Positioned(
+                          top: 10,
+                          right: 10,
+                          child: _snoozedTag(onImage: true),
+                        ),
+                      // Check circle, top-left, while selecting.
+                      if (_selectMode)
+                        Positioned(
+                          top: 10,
+                          left: 10,
+                          child: _selectMark(selected),
+                        ),
+                      if (showBadge)
+                        Positioned(
+                          left: 10,
+                          right: 10,
+                          bottom: 10,
+                          child: Align(
+                            alignment: Alignment.centerLeft,
+                            child: _reminderBadge(
+                              reminder,
+                              repeats: item.repeat.repeats,
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -1939,7 +2617,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             padding: const EdgeInsets.symmetric(vertical: 5),
             child: Dismissible(
               key: ValueKey(item.id),
-              direction: DismissDirection.endToStart,
+              direction: _selectMode
+                  ? DismissDirection.none
+                  : DismissDirection.endToStart,
               onDismissed: (_) => _deleteItem(item),
               background: Container(
                 alignment: Alignment.centerRight,
@@ -1960,14 +2640,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Widget _listRow(SavedItem item) {
     final done = item.isDone;
+    final selected = _selectedIds.contains(item.id);
 
     return Material(
-      color: _muted(0.05),
-      borderRadius: BorderRadius.circular(18),
+      color: selected ? AppColors.accent.withValues(alpha: 0.10) : _muted(0.05),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(18),
+        side: BorderSide(
+          color: selected ? AppColors.accent : Colors.transparent,
+          width: 1.5,
+        ),
+      ),
       child: InkWell(
         borderRadius: BorderRadius.circular(18),
-        onTap: () => _openScreenshot(item),
-        onLongPress: () => _showItemMenu(item),
+        onTap: () => _onItemTap(item),
+        onLongPress: () => _onItemLongPress(item),
         child: Padding(
           padding: const EdgeInsets.all(12),
           child: Row(
@@ -2016,6 +2703,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   ],
                 ),
               ),
+              if (_selectMode) ...[
+                const SizedBox(width: 10),
+                _selectMark(selected),
+              ],
             ],
           ),
         ),
@@ -2029,6 +2720,37 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       child: Icon(Icons.broken_image_outlined, color: _muted(0.4)),
     );
   }
+}
+
+// ───────────────────────── PINNED HEADER ─────────────────────────
+
+/// Keeps the top bar (and the select bar while selecting) fixed at the top
+/// while the rest of the screen scrolls underneath.
+class _FixedHeaderDelegate extends SliverPersistentHeaderDelegate {
+  const _FixedHeaderDelegate({required this.child, required this.height});
+
+  final Widget child;
+  final double height;
+
+  @override
+  double get maxExtent => height;
+
+  @override
+  double get minExtent => height;
+
+  @override
+  Widget build(
+    BuildContext context,
+    double shrinkOffset,
+    bool overlapsContent,
+  ) {
+    // Opaque background, so scrolled content never shows through the bar.
+    return Material(color: AppColors.surface, child: child);
+  }
+
+  @override
+  bool shouldRebuild(covariant _FixedHeaderDelegate oldDelegate) =>
+      oldDelegate.child != child || oldDelegate.height != height;
 }
 
 // ───────────────────────── VIEWER ─────────────────────────
@@ -2384,6 +3106,18 @@ class _ScreenshotViewerState extends State<_ScreenshotViewer> {
                                 ],
                               ),
                               const SizedBox(height: 18),
+                              if (!item.isDone && item.repeat.repeats) ...[
+                                const SizedBox(height: 10),
+                                SizedBox(
+                                  width: double.infinity,
+                                  child: _actionButton(
+                                    icon: Icons.stop_circle_outlined,
+                                    label: 'Stop repeating',
+                                    onTap: () =>
+                                        _finish(_ScreenshotAction.stopRepeat),
+                                  ),
+                                ),
+                              ],
                               Row(
                                 children: [
                                   if (!item.isDone && reminder != null) ...[

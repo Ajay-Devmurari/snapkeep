@@ -20,6 +20,10 @@ class RecentlyDeletedScreen extends StatefulWidget {
 class _RecentlyDeletedScreenState extends State<RecentlyDeletedScreen> {
   final SavedItemsStorage _storage = SavedItemsStorage.instance;
   final List<SavedItem> _items = [];
+
+  // Ids that are being restored or deleted right now. Stops double taps.
+  final Set<String> _busyIds = {};
+
   bool _loading = true;
 
   @override
@@ -140,11 +144,14 @@ class _RecentlyDeletedScreenState extends State<RecentlyDeletedScreen> {
   // ───────────────────────── ACTIONS ─────────────────────────
 
   Future<void> _restore(SavedItem item) async {
+    if (_busyIds.contains(item.id)) return;
+    _busyIds.add(item.id);
     HapticFeedback.lightImpact();
 
     try {
       await _storage.restore(item.id);
     } catch (e) {
+      _busyIds.remove(item.id);
       _snack('Could not restore the item.');
       return;
     }
@@ -160,11 +167,14 @@ class _RecentlyDeletedScreenState extends State<RecentlyDeletedScreen> {
       debugPrint('SnapKeep: could not schedule restored item: $e');
     }
     NotificationService.changes.value++;
+    _busyIds.remove(item.id);
 
     _snack('Restored to your list');
   }
 
   Future<void> _deleteForever(SavedItem item) async {
+    if (_busyIds.contains(item.id)) return;
+
     final ok = await _confirm(
       title: 'Delete permanently?',
       message: 'This screenshot will be gone for good. This cannot be undone.',
@@ -172,6 +182,7 @@ class _RecentlyDeletedScreenState extends State<RecentlyDeletedScreen> {
     );
     if (ok != true || !mounted) return;
 
+    _busyIds.add(item.id);
     HapticFeedback.mediumImpact();
     setState(() => _items.removeWhere((e) => e.id == item.id));
 
@@ -179,6 +190,8 @@ class _RecentlyDeletedScreenState extends State<RecentlyDeletedScreen> {
       await _storage.deletePermanently(item.id);
     } catch (e) {
       debugPrint('SnapKeep: could not delete permanently: $e');
+    } finally {
+      _busyIds.remove(item.id);
     }
   }
 
